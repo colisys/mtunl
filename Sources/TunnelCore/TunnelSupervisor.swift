@@ -23,6 +23,7 @@ public final class TunnelSupervisor: @unchecked Sendable {
         var log: [String] = []
         var retryTimer: DispatchSourceTimer?
         var runningTimer: DispatchSourceTimer?
+        var oneTimePassword: String? // temporary password for this session only
         init(config: TunnelConfig) { self.config = config }
     }
 
@@ -79,6 +80,14 @@ public final class TunnelSupervisor: @unchecked Sendable {
     }
 
     public func start(_ id: UUID) { queue.sync { entries[id].map(startLocked) } }
+    public func start(_ id: UUID, oneTimePassword: String?) {
+        queue.sync {
+            if let entry = entries[id] {
+                entry.oneTimePassword = oneTimePassword
+                startLocked(entry)
+            }
+        }
+    }
     public func stop(_ id: UUID) { queue.sync { entries[id].map(stopLocked) } }
     public func restart(_ id: UUID) { queue.sync { entries[id].map(restartLocked) } }
     public func startAll() { queue.sync { orderedEntries.forEach(startLocked) } }

@@ -63,4 +63,26 @@ final class CommandBuilderTests: XCTestCase {
         XCTAssertEqual(ToolCommand.quote("a b"), "'a b'")
         XCTAssertEqual(ToolCommand.quote("it's"), "'it'\\''s'")
     }
+
+    func testPasswordAuthWithSshpass() throws {
+        guard CommandBuilder.locate("sshpass") != nil else {
+            throw XCTSkip("sshpass not installed (brew install hudochenkov/sshpass/sshpass)")
+        }
+        var config = base(.local)
+        config.sshLoginPassword = "secret123"
+        let command = try CommandBuilder.command(for: config)
+        XCTAssertTrue(command.executable.hasSuffix("sshpass"))
+        XCTAssertEqual(command.arguments[0], "-p")
+        XCTAssertEqual(command.arguments[1], "secret123")
+        XCTAssertEqual(command.arguments[2], "/usr/bin/ssh")
+        // Should not contain BatchMode when using password
+        XCTAssertFalse(command.arguments.contains("BatchMode=yes"))
+    }
+
+    func testNoPasswordUsesBatchMode() throws {
+        let config = base(.local)
+        let command = try CommandBuilder.command(for: config)
+        XCTAssertEqual(command.executable, "/usr/bin/ssh")
+        XCTAssertTrue(command.arguments.contains("BatchMode=yes"))
+    }
 }

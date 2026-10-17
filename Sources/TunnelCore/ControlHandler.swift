@@ -127,7 +127,7 @@ public final class ControlHandler: @unchecked Sendable {
             match = found
         }
         switch request.command {
-        case "start": supervisor.start(match.id)
+        case "start": supervisor.start(match.id, oneTimePassword: request.oneTimePassword)
         case "stop": supervisor.stop(match.id)
         default: supervisor.restart(match.id)
         }

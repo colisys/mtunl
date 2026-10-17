@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import TunnelCore
 
 struct TunnelMenuView: View {
@@ -66,7 +67,14 @@ struct TunnelMenuView: View {
                                 config: config,
                                 status: model.status(for: config),
                                 active: model.isActive(config),
-                                toggle: { model.toggle(config) },
+                                toggle: {
+                                    if !model.isActive(config) && config.sshAuthMethod == .password {
+                                        // Starting with password auth: prompt with NSAlert
+                                        promptForPassword(config: config)
+                                    } else {
+                                        model.toggle(config)
+                                    }
+                                },
                                 edit: { editing = config },
                                 copy: { model.copyCommand(config) },
                                 delete: { model.delete(config) }
@@ -90,9 +98,38 @@ struct TunnelMenuView: View {
             Spacer()
             Button("退出界面") { NSApplication.shared.terminate(nil) }
                 .controlSize(.small)
+                .foregroundStyle(.white)
                 .help("只关闭菜单栏界面，隧道继续由守护进程运行")
             Button("全部停止并退出") { model.quitDaemonAndApp() }
                 .controlSize(.small)
+                .foregroundStyle(.white)
+        }
+    }
+    
+    private func promptForPassword(config: TunnelConfig) {
+        let alert = NSAlert()
+        alert.messageText = "输入 SSH 密码"
+        alert.informativeText = "启动隧道：\(config.name)"
+        alert.alertStyle = .informational
+        
+        let passwordField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        passwordField.placeholderString = "密码"
+        alert.accessoryView = passwordField
+        
+        alert.addButton(withTitle: "启动")
+        alert.addButton(withTitle: "取消")
+        
+        // Make the alert window always on top and activate it
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let response = alert.runModal()
+            
+            if response == .alertFirstButtonReturn {
+                let password = passwordField.stringValue
+                if !password.isEmpty {
+                    model.toggle(config, oneTimePassword: password)
+                }
+            }
         }
     }
 }
@@ -133,7 +170,10 @@ private struct TunnelRow: View {
                 Text(config.name).font(.subheadline.weight(.medium)).lineLimit(1)
                 Text(stateText).font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                Button(active ? "停止" : "启动", action: toggle).controlSize(.small)
+                Button(active ? "停止" : "启动", action: toggle)
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+                    .foregroundStyle(.white)
                 Menu {
                     Button("编辑", action: edit)
                     Button("复制命令", action: copy)

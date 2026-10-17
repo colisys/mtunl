@@ -46,10 +46,13 @@ public struct ControlRequest: Codable, Sendable {
     public var command: String
     /// A tunnel UUID or a unique name.
     public var target: String?
+    /// Optional one-time password for this start command (not saved).
+    public var oneTimePassword: String?
 
-    public init(command: String, target: String? = nil) {
+    public init(command: String, target: String? = nil, oneTimePassword: String? = nil) {
         self.command = command
         self.target = target
+        self.oneTimePassword = oneTimePassword
     }
 }
 

@@ -68,6 +68,13 @@ extension TunnelSupervisor {
 
     func launch(_ entry: Entry) {
         guard entry.desired, entry.process == nil else { return }
+        
+        // If a one-time password was provided, temporarily inject it into the config
+        // Keep it until connection is stable (state becomes .running)
+        if let oneTime = entry.oneTimePassword {
+            entry.config.sshLoginPassword = oneTime
+        }
+        
         let command: ToolCommand
         do {
             command = try resolver(entry.config)
@@ -123,6 +130,11 @@ extension TunnelSupervisor {
         entry.runningTimer = makeTimer(after: stableAfter) { [weak entry] in
             guard let entry, entry.generation == generation, entry.process != nil, !entry.stopping else { return }
             entry.state = .running
+            // Connection is stable, clear one-time password
+            if entry.oneTimePassword != nil {
+                entry.oneTimePassword = nil
+                entry.config.sshLoginPassword = nil
+            }
         }
     }
 
@@ -159,6 +171,23 @@ extension TunnelSupervisor {
             entry.attempts = 0
             return launch(entry)
         }
+        
+        // Check for authentication failure
+        let lastLog = entry.log.last?.lowercased() ?? ""
+        let isAuthFailure = lastLog.contains("permission denied") || 
+                           lastLog.contains("authentication failed") ||
+                           lastLog.contains("authentication failed")
+        
+        if isAuthFailure && entry.oneTimePassword != nil {
+            // Clear password on auth failure and stop retrying
+            entry.oneTimePassword = nil
+            entry.config.sshLoginPassword = nil
+            entry.desired = false
+            entry.state = .failed
+            entry.message = "认证失败，请检查密码"
+            return
+        }
+        
         if uptime >= backoff.healthyUptime { entry.attempts = 0 }
         let reason = entry.log.last ?? (signaled ? "进程被信号终止（\(status)）" : "进程退出（代码 \(status)）")
         scheduleRetry(entry, reason: reason)

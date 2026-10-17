@@ -74,8 +74,28 @@ struct TunnelEditor: View {
                     TextField("端口", text: $sshPort).textFieldStyle(.roundedBorder).frame(width: 64)
                 }
                 .controlSize(.small)
-                TextField("私钥路径（可选，只存路径）", text: $identity)
-                    .textFieldStyle(.roundedBorder).controlSize(.small)
+                
+                Picker("认证方式", selection: $config.sshAuthMethod) {
+                    ForEach(SSHAuthMethod.allCases, id: \.self) { method in
+                        Text(method.rawValue).tag(method)
+                    }
+                }
+                .controlSize(.small)
+                .pickerStyle(.segmented)
+                
+                if config.sshAuthMethod == .privateKey {
+                    TextField("私钥路径（可选）", text: $identity)
+                        .textFieldStyle(.roundedBorder).controlSize(.small)
+                    Text("若私钥已加密，请提前运行 ssh-add 添加到 SSH agent")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("启动时输入 SSH 密码")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                
                 TextField("跳板机（可选，如 user@bastion）", text: $jump)
                     .textFieldStyle(.roundedBorder).controlSize(.small)
             }
@@ -115,9 +135,12 @@ struct TunnelEditor: View {
             }
             HStack {
                 Spacer()
-                Button("取消", action: cancel).controlSize(.small)
+                Button("取消", action: cancel)
+                    .controlSize(.small)
+                    .foregroundStyle(.white)
                 Button("保存") { commit() }
                     .controlSize(.small)
+                    .foregroundStyle(.white)
                     .keyboardShortcut(.defaultAction)
             }
         }

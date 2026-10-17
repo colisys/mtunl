@@ -57,6 +57,7 @@ struct MihomoPanel: View {
                             .textFieldStyle(.roundedBorder)
                         Button("选择…") { chooseBinary() }
                             .controlSize(.small)
+                            .foregroundStyle(.white)
                     }
                     .controlSize(.small)
 
@@ -90,6 +91,7 @@ struct MihomoPanel: View {
                             Button(model.mihomoStatus.downloadButtonTitle) { model.downloadMihomo() }
                                 .disabled(model.mihomoStatus.downloadInProgress == true)
                                 .controlSize(.small)
+                                .foregroundStyle(.white)
                                 .fixedSize()
                         }
                         Button { 
@@ -99,11 +101,13 @@ struct MihomoPanel: View {
                                 .frame(minWidth: 34)
                         }
                         .controlSize(.small)
+                        .foregroundStyle(.white)
                         .fixedSize(horizontal: true, vertical: false)
                         .disabled(model.mihomoStatus.state == .failed && selectedTunnel == nil)
                     }
                     Button("重置授权") { model.send("mihomo-helper-reset") }
                         .controlSize(.small)
+                        .foregroundStyle(.white)
                         .disabled(model.mihomoStatus.state == .running || model.mihomoStatus.state == .starting)
 
                     if let message = model.mihomoStatus.downloadMessage {

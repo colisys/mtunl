@@ -5,10 +5,12 @@ import Foundation
 public struct ToolCommand: Equatable, Sendable {
     public var executable: String
     public var arguments: [String]
+    public var environment: [String: String]?
 
-    public init(executable: String, arguments: [String]) {
+    public init(executable: String, arguments: [String], environment: [String: String]? = nil) {
         self.executable = executable
         self.arguments = arguments
+        self.environment = environment
     }
 
     public var shellString: String {
@@ -51,6 +53,7 @@ public enum CommandBuilder {
     }
 
     /// Builds the command for a config. Call `validate()` first.
+    /// Reads `config.sshLoginPassword` for password authentication (requires sshpass).
     public static func command(for config: TunnelConfig, socatPath: String? = nil) throws -> ToolCommand {
         if config.kind == .relay {
             guard let socat = socatPath ?? locate("socat") else { throw CommandBuilderError.toolNotFound("socat") }
@@ -62,14 +65,18 @@ public enum CommandBuilder {
         // exit immediately while the forward lives in another process.
         var args = [
             "-N",
-            "-o", "BatchMode=yes",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "ConnectTimeout=10",
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
+            "-o", "StrictHostKeyChecking=accept-new",
         ]
+        // BatchMode is incompatible with password auth and first-time host key acceptance
+        if config.sshLoginPassword == nil {
+            args += ["-o", "BatchMode=yes"]
+        }
         if let port = config.sshPort { args += ["-p", String(port)] }
         if let identity = config.identityFile, !identity.isEmpty {
             args += ["-i", identity, "-o", "IdentitiesOnly=yes"]
@@ -89,6 +96,14 @@ public enum CommandBuilder {
         }
         // `--` stops option parsing so a destination can never be read as a flag.
         args += ["--", config.destination]
+        
+        // Wrap with sshpass if password is provided
+        if let password = config.sshLoginPassword {
+            guard let sshpass = locate("sshpass") else {
+                throw CommandBuilderError.toolNotFound("sshpass")
+            }
+            return ToolCommand(executable: sshpass, arguments: ["-p", password, sshPath] + args)
+        }
         return ToolCommand(executable: sshPath, arguments: args)
     }
 }

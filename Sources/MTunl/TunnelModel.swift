@@ -101,15 +101,15 @@ final class TunnelModel: ObservableObject {
         return state != .stopped && state != .failed
     }
 
-    func toggle(_ config: TunnelConfig) {
-        send(isActive(config) ? "stop" : "start", target: config.id.uuidString)
+    func toggle(_ config: TunnelConfig, oneTimePassword: String? = nil) {
+        send(isActive(config) ? "stop" : "start", target: config.id.uuidString, oneTimePassword: oneTimePassword)
     }
 
-    func send(_ command: String, target: String? = nil) {
+    func send(_ command: String, target: String? = nil, oneTimePassword: String? = nil) {
         let client = self.client
         Task {
             let result = await Task.detached {
-                Result { try client.send(ControlRequest(command: command, target: target)) }
+                Result { try client.send(ControlRequest(command: command, target: target, oneTimePassword: oneTimePassword)) }
             }.value
             switch result {
             case .success(let response):

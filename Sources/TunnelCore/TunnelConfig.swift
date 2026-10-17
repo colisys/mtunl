@@ -1,8 +1,21 @@
 import Foundation
 
+public enum SSHAuthMethod: String, Codable, Sendable, CaseIterable {
+    case password = "密码"
+    case privateKey = "密钥"
+}
+
 /// A saved tunnel definition. Only the *path* of an identity file is stored;
 /// no passwords or key material ever touch this model.
-public struct TunnelConfig: Codable, Identifiable, Equatable, Sendable {
+/// `sshLoginPassword` is runtime-only and never serialized.
+public struct TunnelConfig: Identifiable, Equatable, Sendable {
+    
+    enum CodingKeys: String, CodingKey {
+        case id, name, kind, host, user, sshPort, identityFile, jumpHost
+        case bindAddress, listenPort, targetHost, targetPort, autoStart
+        case sshAuthMethod
+    }
+    
     public var id: UUID
     public var name: String
     public var kind: TunnelKind
@@ -19,6 +32,10 @@ public struct TunnelConfig: Codable, Identifiable, Equatable, Sendable {
     public var targetHost: String
     public var targetPort: Int
     public var autoStart: Bool
+    /// SSH authentication method: password or private key
+    public var sshAuthMethod: SSHAuthMethod
+    /// Runtime-only SSH login password, never saved. Used for password authentication (requires sshpass).
+    public var sshLoginPassword: String?
 
     public static let loopback = "127.0.0.1"
 
@@ -35,7 +52,9 @@ public struct TunnelConfig: Codable, Identifiable, Equatable, Sendable {
         listenPort: Int = 0,
         targetHost: String = "localhost",
         targetPort: Int = 0,
-        autoStart: Bool = false
+        autoStart: Bool = false,
+        sshAuthMethod: SSHAuthMethod = .privateKey,
+        sshLoginPassword: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -50,6 +69,8 @@ public struct TunnelConfig: Codable, Identifiable, Equatable, Sendable {
         self.targetHost = targetHost
         self.targetPort = targetPort
         self.autoStart = autoStart
+        self.sshAuthMethod = sshAuthMethod
+        self.sshLoginPassword = sshLoginPassword
     }
 
     /// True when the listening side accepts connections from other machines.
@@ -73,5 +94,45 @@ public struct TunnelConfig: Codable, Identifiable, Equatable, Sendable {
         case .relay:
             return "本地 → 目标：\(bindAddress):\(listenPort) → \(targetHost):\(targetPort)"
         }
+    }
+}
+
+extension TunnelConfig: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        kind = try container.decode(TunnelKind.self, forKey: .kind)
+        host = try container.decode(String.self, forKey: .host)
+        user = try container.decodeIfPresent(String.self, forKey: .user)
+        sshPort = try container.decodeIfPresent(Int.self, forKey: .sshPort)
+        identityFile = try container.decodeIfPresent(String.self, forKey: .identityFile)
+        jumpHost = try container.decodeIfPresent(String.self, forKey: .jumpHost)
+        bindAddress = try container.decode(String.self, forKey: .bindAddress)
+        listenPort = try container.decode(Int.self, forKey: .listenPort)
+        targetHost = try container.decode(String.self, forKey: .targetHost)
+        targetPort = try container.decode(Int.self, forKey: .targetPort)
+        autoStart = try container.decode(Bool.self, forKey: .autoStart)
+        sshAuthMethod = try container.decodeIfPresent(SSHAuthMethod.self, forKey: .sshAuthMethod) ?? .privateKey
+        sshLoginPassword = nil  // Never decoded
+    }
+    
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(host, forKey: .host)
+        try container.encodeIfPresent(user, forKey: .user)
+        try container.encodeIfPresent(sshPort, forKey: .sshPort)
+        try container.encodeIfPresent(identityFile, forKey: .identityFile)
+        try container.encodeIfPresent(jumpHost, forKey: .jumpHost)
+        try container.encode(bindAddress, forKey: .bindAddress)
+        try container.encode(listenPort, forKey: .listenPort)
+        try container.encode(targetHost, forKey: .targetHost)
+        try container.encode(targetPort, forKey: .targetPort)
+        try container.encode(autoStart, forKey: .autoStart)
+        try container.encode(sshAuthMethod, forKey: .sshAuthMethod)
+        // sshLoginPassword is never encoded
     }
 }
