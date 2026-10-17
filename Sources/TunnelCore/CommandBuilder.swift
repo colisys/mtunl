@@ -77,14 +77,15 @@ public enum CommandBuilder {
             "-o", "ConnectTimeout=10",
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
-            "-o", "StrictHostKeyChecking=yes",
+            "-o", "StrictHostKeyChecking=ask",
         ]
         args += ["-o", "PreferredAuthentications=publickey,password", "-o", "KbdInteractiveAuthentication=no"]
+        args += ["-o", "BatchMode=no"]
         if passwordFallback {
-            args += ["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1",
+            args += ["-o", "NumberOfPasswordPrompts=1",
                      "-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=yes"]
         } else {
-            args += ["-o", "BatchMode=yes"]
+            args += ["-o", "PasswordAuthentication=no"]
         }
         if let port = config.sshPort { args += ["-p", String(port)] }
         if let identity = config.identityFile, !identity.isEmpty {

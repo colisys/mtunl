@@ -6,6 +6,7 @@ extension TunnelSupervisor {
 
     func startLocked(_ entry: Entry) {
         entry.passwordRequestID = nil
+        entry.hostKeyRequest = nil
         entry.desired = true
         if entry.process != nil {
             if entry.stopping { entry.relaunchNow = true }
@@ -21,6 +22,9 @@ extension TunnelSupervisor {
         entry.oneTimePassword = nil
         entry.passwordRequestID = nil
         entry.sshTarget = nil
+        entry.hostKeyRequest = nil
+        entry.hostKeyEvent = nil
+        entry.acceptedHostKeys.removeAll()
         entry.relaunchNow = false
         entry.retryTimer?.cancel()
         entry.retryTimer = nil
@@ -77,6 +81,7 @@ extension TunnelSupervisor {
         let useBridge = entry.config.kind.usesSSH && (resolver == nil || entry.oneTimePassword != nil)
         entry.usesBridge = useBridge
         entry.eventBuffer.removeAll()
+        entry.hostKeyEvent = nil
         let command: ToolCommand
         do {
             if let resolver {
@@ -112,9 +117,16 @@ extension TunnelSupervisor {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: useBridge ? bridgePath : command.executable)
         var arguments = command.arguments
-        if useBridge, entry.oneTimePassword != nil, let target = entry.sshTarget {
-            // The bridge sends a password only when the identity ssh reports matches this exact target.
-            arguments = ["--expect", target.user, target.host, target.port, "--"] + arguments
+        if useBridge {
+            var bridgeOptions: [String] = []
+            for key in entry.acceptedHostKeys {
+                bridgeOptions += ["--accept", key.host, key.fingerprint]
+            }
+            if entry.oneTimePassword != nil, let target = entry.sshTarget {
+                // The bridge sends a password only when the identity ssh reports matches this exact target.
+                bridgeOptions += ["--expect", target.user, target.host, target.port]
+            }
+            arguments = bridgeOptions + ["--"] + arguments
         }
         process.arguments = arguments
         let secretPipe = useBridge ? Pipe() : nil
@@ -137,14 +149,17 @@ extension TunnelSupervisor {
         entry.generation += 1
         let generation = entry.generation
         pipe.fileHandleForReading.readabilityHandler = { [weak self, weak entry] handle in
+            guard let entry else { return }
+            entry.pendingEventReads.enter()
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                return
+            } else {
+                self?.queue.async {
+                    if entry.generation == generation { Self.append(data, to: entry) }
+                }
             }
-            self?.queue.async {
-                if let entry, entry.generation == generation { Self.append(data, to: entry) }
-            }
+            entry.pendingEventReads.leave()
         }
         process.terminationHandler = { [weak self] finished in
             self?.queue.async {
@@ -187,6 +202,9 @@ extension TunnelSupervisor {
                 if line.hasPrefix("MTUNL_TARGET "), let target = SSHTarget(event: line) {
                     entry.sshTarget = target
                 }
+                if line.hasPrefix("MTUNL_HOSTKEY "), let key = SSHHostKey(event: line) {
+                    entry.hostKeyEvent = key
+                }
                 // Never expose unrecognized helper output, even if a child echoes a secret.
             }
             if entry.eventBuffer.count > 4096 { entry.eventBuffer.removeAll() }
@@ -203,6 +221,18 @@ extension TunnelSupervisor {
 
     private func handleExit(_ entry: Entry, generation: Int, status: Int32, signaled: Bool) {
         guard entry.generation == generation else { return }
+        // A readability callback may already have drained bytes before enqueueing its append.
+        entry.errorPipe?.fileHandleForReading.readabilityHandler = nil
+        entry.pendingEventReads.wait()
+        Self.finishStderr(entry)
+        queue.async { [weak self, weak entry] in
+            guard let self, let entry else { return }
+            self.completeExit(entry, generation: generation, status: status, signaled: signaled)
+        }
+    }
+
+    private func completeExit(_ entry: Entry, generation: Int, status: Int32, signaled: Bool) {
+        guard entry.generation == generation else { return }
         let uptime = entry.startedAt.map { Date().timeIntervalSince($0) } ?? 0
         cancelTimers(entry)
         Self.finishStderr(entry)
@@ -217,6 +247,29 @@ extension TunnelSupervisor {
         guard entry.desired else {
             entry.state = .stopped
             entry.message = nil
+            return
+        }
+        if entry.usesBridge && status == 80 && !signaled {
+            entry.desired = false
+            entry.relaunchNow = false
+            if let key = entry.hostKeyEvent {
+                entry.hostKeyRequest = HostKeyChallenge(host: key.host, fingerprint: key.fingerprint, requestID: UUID())
+                entry.state = .failed
+                entry.message = "等待确认 SSH 主机指纹"
+            } else {
+                entry.state = .failed
+                entry.message = "无法读取 SSH 主机指纹，已停止连接"
+            }
+            return
+        }
+        if entry.usesBridge && status == 81 && !signaled {
+            entry.oneTimePassword = nil
+            entry.sshTarget = nil
+            entry.hostKeyRequest = nil
+            entry.desired = false
+            entry.relaunchNow = false
+            entry.state = .failed
+            entry.message = "SSH 主机指纹已变化或连接被拒绝；请核实服务器后再处理 known_hosts"
             return
         }
         if entry.usesBridge && status == 79 && !signaled && entry.oneTimePassword == nil && entry.sshTarget != nil {
@@ -237,7 +290,7 @@ extension TunnelSupervisor {
             entry.oneTimePassword = nil
             entry.desired = false
             entry.state = .failed
-            entry.message = status == 78 || status == 79 ? "认证提示不明确，已拒绝发送密码（请改用密钥或 agent）" : "认证失败，请重新输入密码"
+            entry.message = status == 78 || status == 79 ? "无法识别 SSH 认证提示，已停止（若私钥已加密，请先运行 ssh-add）" : "认证失败，请重新输入密码"
             return
         }
         

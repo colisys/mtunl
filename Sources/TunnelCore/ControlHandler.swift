@@ -98,7 +98,7 @@ public final class ControlHandler: @unchecked Sendable {
         case "stopAll":
             supervisor.stopAll()
             return ControlResponse(success: true, statuses: supervisor.statuses(), mihomo: mihomo.currentStatus())
-        case "start", "startSession", "stop", "restart":
+        case "start", "startSession", "trustHostKey", "stop", "restart":
             return perform(request)
         case "shutdown":
             mihomo.stop()
@@ -130,6 +130,10 @@ public final class ControlHandler: @unchecked Sendable {
         case "startSession":
             guard supervisor.supplyPassword(match.id, requestID: request.passwordRequestID, password: request.oneTimePassword) else {
                 return ControlResponse(success: false, error: "密码请求已过期或目标尚未明确请求密码，请重新启动认证")
+            }
+        case "trustHostKey":
+            guard supervisor.trustHostKey(match.id, requestID: request.hostKeyRequestID) else {
+                return ControlResponse(success: false, error: "主机指纹请求已过期，请重新连接并核对指纹")
             }
         case "start": supervisor.start(match.id)
         case "stop": supervisor.stop(match.id)

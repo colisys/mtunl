@@ -7,7 +7,6 @@ The password success line follows the same format as the captured publickey succ
 it was not captured from a real password login.
 """
 import os
-from pathlib import Path
 import secrets
 import signal
 import struct
@@ -15,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = r'''
@@ -73,6 +73,18 @@ int main(int argc, char **argv) {
         line(text);
         line("Host key verification failed.");
         return 255;
+    }
+    if (!strcmp(mode, "unknown-hostkey")) {
+        snprintf(prompt, sizeof prompt,
+                 "The authenticity of host '[%s]:%s (%s)' can't be established.\r\n"
+                 "ED25519 key fingerprint is SHA256:AbCdEf0123456789+/.\r\n"
+                 "This key is not known by any other names.\r\n"
+                 "Are you sure you want to continue connecting (yes/no/[fingerprint])? ", host, port, host);
+        int got = ask(prompt, reply, sizeof reply, 1);
+        if (got < 0) return 91;
+        if (!got || strcmp(reply, "yes\n")) return 255;
+        line("Authenticated to host ([127.0.0.1]:22) using \"publickey\".");
+        return 0;
     }
     if (!strcmp(mode, "hang")) { sleep(20); return 0; }
     if (!strcmp(mode, "publickey") || !strcmp(mode, "publickey-via-proxy")) {
@@ -149,15 +161,19 @@ class BridgeTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def run_bridge(self, mode, frame=None, expected=0, env=None, expect=("user", "host", "22"),
-                   dest=("user", "host", "22"), secret=None):
+                   dest=("user", "host", "22"), secret=None, accepts=()):
         if secret is None:
             secret = secrets.token_hex(16).encode()
         if frame is None:
             frame = struct.pack("!I", len(secret)) + secret
-        args = [str(self.bridge)] + (["--expect", *expect, "--"] if expect else [])
-        args += ["-p", dest[2], "--", f"{dest[0]}@{dest[1]}"]
+        args = [str(self.bridge)]
+        for host, fingerprint in accepts:
+            args += ["--accept", host, fingerprint]
+        if expect:
+            args += ["--expect", *expect]
+        args += ["--", "-p", dest[2], "--", f"{dest[0]}@{dest[1]}"]
         run_env = dict(os.environ if env is None else env, FAKE_MODE=mode)
-        result = subprocess.run(args, input=frame, capture_output=True, timeout=15, env=run_env)
+        result = subprocess.run(args, input=frame, capture_output=True, timeout=15, env=run_env, check=False)
         self.assertEqual(result.returncode, expected, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertNotIn(secret, result.stderr)
@@ -207,9 +223,20 @@ class BridgeTests(unittest.TestCase):
         # A secret without an expected target is refused before ssh is started.
         self.run_bridge("password-accept", expect=None, expected=78)
 
-    def test_host_key_and_network_failures_never_request_password(self):
-        self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", self.run_bridge("hostkey", frame=self.empty_frame(), expected=255))
-        self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", self.run_bridge("hostkey", expected=255))
+    def test_host_key_confirmation_is_one_shot_and_fingerprint_bound(self):
+        fingerprint = "SHA256:AbCdEf0123456789+/"
+        output = self.run_bridge("unknown-hostkey", frame=self.empty_frame(), expected=80)
+        self.assertIn(f"MTUNL_HOSTKEY [host]:22 {fingerprint}".encode(), output)
+        self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", output)
+        accepted = self.run_bridge("unknown-hostkey", frame=self.empty_frame(), accepts=(("[host]:22", fingerprint),))
+        self.assertIn(b"MTUNL_AUTHENTICATED", accepted)
+        self.run_bridge("unknown-hostkey", frame=self.empty_frame(), expected=80,
+                        accepts=(("[host]:22", "SHA256:DifferentFingerprint"),))
+
+    def test_changed_host_key_and_network_failures_never_request_password(self):
+        output = self.run_bridge("hostkey", frame=self.empty_frame(), expected=81)
+        self.assertIn(b"SSH host key verification failed", output)
+        self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", output)
         output = self.run_bridge("refused", frame=self.empty_frame(), expected=255)
         self.assertNotIn(b"MTUNL_TARGET", output)
         self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", output)
@@ -231,7 +258,7 @@ class BridgeTests(unittest.TestCase):
         # Real OpenSSH on a closed loopback port: confirms -E /dev/fd/1 is writable with no network.
         result = subprocess.run(["/usr/bin/ssh", "-v", "-E", "/dev/fd/1", "-o", "ConnectTimeout=2",
                                  "-F", "/dev/null", "-p", "1", "--", "apple@127.0.0.1"],
-                                capture_output=True, timeout=10)
+                                capture_output=True, timeout=10, check=False)
         self.assertEqual(result.returncode, 255)
         self.assertIn(b"connect to address 127.0.0.1 port 1: Connection refused", result.stdout)
 
@@ -240,20 +267,23 @@ class BridgeTests(unittest.TestCase):
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              env=dict(os.environ, FAKE_MODE="hang"))
         try:
+            stdin, stdout, stderr, pid = p.stdin, p.stdout, p.stderr, p.pid
+            assert stdin is not None and stdout is not None and stderr is not None and pid is not None
             secret = secrets.token_hex(16)
-            p.stdin.write(struct.pack("!I", 32) + secret.encode()); p.stdin.close()
+            stdin.write(struct.pack("!I", 32) + secret.encode()); stdin.close()
             child = None
             for _ in range(100):
                 listing = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True)
                 self.assertNotIn(secret, listing)
                 for line in listing.splitlines():
                     fields = line.split(None, 2)
-                    if len(fields) == 3 and fields[1] == str(p.pid) and " -v " in fields[2]:
+                    if len(fields) == 3 and fields[1] == str(pid) and " -v " in fields[2]:
                         child = int(fields[0])
                 if child:
                     break
                 time.sleep(.02)
             self.assertIsNotNone(child)
+            assert child is not None
             p.send_signal(signal.SIGTERM)
             self.assertEqual(p.wait(timeout=3), 0)
             with self.assertRaises(ProcessLookupError):
@@ -261,7 +291,10 @@ class BridgeTests(unittest.TestCase):
         finally:
             if p.poll() is None:
                 p.kill(); p.wait()
-            p.stdout.close(); p.stderr.close()
+            if p.stdout is not None:
+                p.stdout.close()
+            if p.stderr is not None:
+                p.stderr.close()
 
 
 if __name__ == "__main__":

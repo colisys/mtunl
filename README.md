@@ -16,12 +16,11 @@ macOS 菜单栏 SSH 隧道管理工具。只包装系统 `/usr/bin/ssh`（以及
 
 ## 认证与安全
 
-- 默认使用密钥 / ssh-agent / `~/.ssh/config`，`BatchMode=yes`。可选“密钥优先 + 密码回退”：由 SSH 自行先尝试 agent/默认或指定密钥，再由编译的 PTY bridge 响应原生 password 提示，不依赖 sshpass。
-- 密码只通过现有私有控制 socket 和匿名 stdin pipe 传递，不进入 argv、环境变量、命令预览、status、日志或外部文件。内存会话缓存支持重连，直至停止、删除、配置变化、认证失败或 daemon 退出。关闭 UI 不清除活跃 daemon 会话。
-- 密码回退保留 SSH config、别名、ProxyJump/ProxyCommand。启动优先尝试密钥；密钥未成功，或服务端方法列表明确不提供 publickey 时,仅最终目标认证阶段明确提供 password 且出现身份匹配无回显提示才弹密码框（支持仅 password 的服务器）；网络/host-key 错误不会弹。支持跳板 agent/密钥 → 目标密码，不把目标密码交给跳板、MFA 或 passphrase。
-- bridge 从真实主 SSH `-E` 详细日志实时读取目标认证身份与密码提示，只在身份与提示一致时响应；能力证据来自实际用户认证阶段的方法列表，不来自 `-G`、`-Q` 或传输握手。SSH 运行状态以明确认证成功事件为准，不再按存活时长判断。
-- 用户 SSH 配置可执行本地命令，本来就是 SSH 的信任边界；上述识别不能保证 ProxyCommand 安全。不新增环境变量配置 helper；正常继承系统 `SSH_AUTH_SOCK`。不明确的目标身份/提示安全失败，密码缓存绑定最终 user/hostname/port。
-- 所有连接使用 `StrictHostKeyChecking=yes`，不自动接受未知或变化主机密钥；首次使用需在独立终端核验指纹。详细安全边界、内存擦除限制、排错见 [FEATURES.md](FEATURES.md)。
+- 使用系统 `/usr/bin/ssh`、系统配置和 agent；PTY bridge 只处理系统 SSH 的交互，不实现 SSH 协议。
+- 未知主机时在界面核对系统 SSH 提供的 SHA256 指纹后可信任并连接；变化的指纹直接失败，不自动覆盖 `known_hosts`。
+- 可选密钥优先、密码回退。密码不进入 argv、环境变量、配置、日志或命令预览，仅由 daemon 暂存在内存中。加密私钥请先用 `ssh-add` 解锁。
+- 保留 SSH 别名、ProxyJump 和 ProxyCommand。SSH 配置可能执行本地命令，应只使用可信配置；MFA、跳板密码和交互式认证不自动处理。
+- 详细说明见 [FEATURES.md](FEATURES.md)。
 - 监听地址默认 `127.0.0.1`。改成其他地址会让局域网设备访问该端口，界面会给出警告。
 - MTunl 自身的启动参数以 argv 传给进程，不经过 shell（受信任 SSH 配置仍可能执行 shell 命令）；主机、用户、跳板机等字段拒绝以 `-` 开头的值，并在目标前加 `--`。
 - 控制 socket 位于 `/tmp/mtunl-<uid>/ctl.sock`，目录和文件仅当前用户可访问，并校验对端 uid。
@@ -82,11 +81,11 @@ MTunl（包括 `MTunl`、`mtunlctl`、`mtunl-helper` 及 `TunnelCore`）采用 *
 - `Sources/TunnelCore`：配置模型与校验、命令生成、SSH / Mihomo 进程监督、Mihomo 官方内核下载与缓存、控制协议与 socket、LaunchAgent。
 - `Sources/mtunlctl`：CLI 与用户守护进程入口。
 - `Sources/mtunl-helper`：特权 helper 入口，构建脚本会一起打包 / 签名。
-- `Sources/mtunl-ssh-bridge`：非特权、编译的 PTY SSH 密码桥，同目录打包 / 签名；缺失时密码启动安全失败。更新时需自行停止旧 daemon 并运行新版；旧 daemon 会拒绝新的 `startSession` 命令。
+- `Sources/mtunl-ssh-bridge`：非特权 PTY 桥，处理 SSH 认证与主机指纹确认；需与 app、daemon 一起更新。
 - `Sources/MTunl`：菜单栏界面。
 - `Tests/TunnelCoreTests`：用 `sleep` / `false` 代替 ssh 测试监督逻辑，不建立真实连接。
 
 ```sh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -j 1
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -j 2
 python3 scripts/test-ssh-bridge.py
 ```

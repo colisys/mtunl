@@ -73,7 +73,7 @@ final class CommandBuilderTests: XCTestCase {
         }
         for option in ["PreferredAuthentications=publickey,password", "BatchMode=no",
                        "KbdInteractiveAuthentication=no", "NumberOfPasswordPrompts=1",
-                       "StrictHostKeyChecking=yes"] {
+                       "StrictHostKeyChecking=ask", "PasswordAuthentication=yes"] {
             XCTAssertTrue(command.arguments.contains(option), option)
         }
         XCTAssertFalse(command.shellString.contains("sshpass"))
@@ -89,10 +89,12 @@ final class CommandBuilderTests: XCTestCase {
         XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "-J")) + 1], "bastion")
     }
 
-    func testNoPasswordUsesBatchMode() throws {
-        let config = base(.local)
-        let command = try CommandBuilder.command(for: config)
+    func testKeyOnlyModeAllowsHostKeyPromptButNotPasswordAuthentication() throws {
+        let command = try CommandBuilder.command(for: base(.local))
         XCTAssertEqual(command.executable, "/usr/bin/ssh")
-        XCTAssertTrue(command.arguments.contains("BatchMode=yes"))
+        XCTAssertTrue(command.arguments.contains("StrictHostKeyChecking=ask"))
+        XCTAssertTrue(command.arguments.contains("BatchMode=no"))
+        XCTAssertTrue(command.arguments.contains("PasswordAuthentication=no"))
+        XCTAssertFalse(command.arguments.contains("BatchMode=yes"))
     }
 }

@@ -20,6 +20,9 @@
 #define AUTH_FAILURE 77
 #define UNSUPPORTED 78
 #define PASSWORD_REQUIRED 79
+#define HOSTKEY_REQUIRED 80
+#define HOSTKEY_FAILED 81
+#define MAX_ACCEPTED_HOST_KEYS 128
 static volatile sig_atomic_t stopping;
 static void stop(int sig) { (void)sig; stopping = 1; }
 static void wipe(void *p, size_t n) { volatile unsigned char *v = p; while (n--) *v++ = 0; }
@@ -47,7 +50,11 @@ static void sanitize_askpass(void) {
 // Target identity and password prompt come only from the real `ssh -v` output of the
 // final connection, never from a separate `ssh -G` evaluation.
 struct identity { char user[256], host[512], port[8], prompt[800]; };
+struct accepted_host_key { char host[512], fingerprint[128]; };
 static const char *expect_user, *expect_host, *expect_port;
+static struct accepted_host_key accepted_host_keys[MAX_ACCEPTED_HOST_KEYS];
+static size_t accepted_host_key_count;
+static char requested_host[512], requested_fingerprint[128];
 static uint32_t secret_length;
 static int identifier(const char *s) {
     if (!*s) return 0;
@@ -81,7 +88,7 @@ static int parse_target(const char *s, struct identity *id) {
     snprintf(id->prompt, sizeof(id->prompt), "%s@%s's password: ", id->user, id->host);
     return 1;
 }
-struct auth { int context, target_ok, password_allowed, password_phase, authenticated, failed, ambiguous; };
+struct auth { int context, target_ok, password_allowed, password_phase, authenticated, failed, ambiguous, hostkey_failed; };
 static int has_method(const char *s, const char *method) {
     while (*s) {
         size_t n = strcspn(s, ",");
@@ -91,6 +98,7 @@ static int has_method(const char *s, const char *method) {
     return 0;
 }
 static void diagnostic(const char *line, struct identity *id, struct auth *a) {
+    if (strstr(line, "Host key verification failed.")) { a->hostkey_failed = 1; return; }
     const char *begin = "debug1: Authenticating to ";
     if (!strncmp(line, begin, strlen(begin))) {
         // A second target means ProxyJump/reconnect state we cannot attribute: fail closed.
@@ -122,16 +130,90 @@ static void diagnostic(const char *line, struct identity *id, struct auth *a) {
     }
     if (strstr(line, "Permission denied") || strstr(line, "No more authentication methods to try")) a->failed = 1;
 }
+static int valid_fingerprint(const char *s) {
+    if (strncmp(s, "SHA256:", 7) || !s[7] || strlen(s) >= sizeof(requested_fingerprint)) return 0;
+    for (s += 7; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=')) return 0;
+    }
+    return 1;
+}
+static int could_be_hostkey_prompt(const char *s, size_t n) {
+    static const char prefix[] = "The authenticity of host '";
+    size_t length = sizeof(prefix) - 1;
+    return n <= length ? !memcmp(s, prefix, n) : !memcmp(s, prefix, length);
+}
+static int ends_with(const char *s, const char *suffix) {
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && !memcmp(s + n - m, suffix, m);
+}
+static int parse_hostkey_prompt(const char *prompt, char *host, size_t host_size,
+                                char *fingerprint, size_t fingerprint_size) {
+    static const char prefix[] = "The authenticity of host '";
+    static const char marker[] = " key fingerprint is ";
+    static const char suffix[] = "(yes/no/[fingerprint])? ";
+    if (strncmp(prompt, prefix, sizeof(prefix) - 1) || !ends_with(prompt, suffix)) return 0;
+    const char *start = prompt + sizeof(prefix) - 1;
+    const char *host_end = strstr(start, " (");
+    const char *fp = strstr(start, marker);
+    if (!host_end || !fp || host_end <= start || fp <= host_end) return 0;
+    size_t host_length = (size_t)(host_end - start);
+    if (!host_length || host_length >= host_size) return 0;
+    memcpy(host, start, host_length); host[host_length] = 0;
+    const char *fp_start = fp + sizeof(marker) - 1;
+    const char *fp_end = fp_start;
+    while (*fp_end && *fp_end != '\r' && *fp_end != '\n') fp_end++;
+    if (fp_end > fp_start && fp_end[-1] == '.') fp_end--;
+    size_t fp_length = (size_t)(fp_end - fp_start);
+    if (!fp_length || fp_length >= fingerprint_size) return 0;
+    memcpy(fingerprint, fp_start, fp_length); fingerprint[fp_length] = 0;
+    if (!identifier(host) || !valid_fingerprint(fingerprint)) return 0;
+    return 1;
+}
+static int accepted_hostkey(const char *host, const char *fingerprint) {
+    for (size_t i = 0; i < accepted_host_key_count; i++)
+        if (!strcmp(accepted_host_keys[i].host, host) &&
+            !strcmp(accepted_host_keys[i].fingerprint, fingerprint)) return 1;
+    return 0;
+}
+static int answer_yes(int fd) {
+    static const char answer[] = "yes\n";
+    struct termios original, quiet;
+    int restore = tcgetattr(fd, &original) == 0;
+    if (restore) {
+        quiet = original; quiet.c_lflag &= (tcflag_t)~ECHO;
+        if (tcsetattr(fd, TCSANOW, &quiet) != 0) restore = 0;
+    }
+    ssize_t written = write(fd, answer, sizeof(answer) - 1);
+    if (restore) tcsetattr(fd, TCSANOW, &original);
+    return written == (ssize_t)(sizeof(answer) - 1);
+}
 int main(int argc, char **argv) {
     struct rlimit core = {0, 0}; setrlimit(RLIMIT_CORE, &core);
     signal(SIGTERM, stop); signal(SIGINT, stop); signal(SIGHUP, stop); signal(SIGPIPE, SIG_IGN);
     unsigned char header[4], password[1024] = {0};
     int result = UNSUPPORTED, master = -1, logs[2] = {-1, -1}, status = 0;
     pid_t child = -1;
-    if (argc >= 7 && !strcmp(argv[1], "--expect") && !strcmp(argv[5], "--")) {
-        expect_user = argv[2]; expect_host = argv[3]; expect_port = argv[4];
-        argc -= 5; argv += 5;
+    int separator = -1, expect_seen = 0;
+    for (int i = 1; i < argc;) {
+        if (!strcmp(argv[i], "--")) { separator = i; break; }
+        if (!strcmp(argv[i], "--expect") && i + 3 < argc && !expect_seen) {
+            expect_user = argv[i + 1]; expect_host = argv[i + 2]; expect_port = argv[i + 3];
+            expect_seen = 1; i += 4; continue;
+        }
+        if (!strcmp(argv[i], "--accept") && i + 2 < argc && accepted_host_key_count < MAX_ACCEPTED_HOST_KEYS) {
+            const char *host = argv[i + 1], *fingerprint = argv[i + 2];
+            if (!identifier(host) || strlen(host) >= sizeof(accepted_host_keys[0].host) ||
+                !valid_fingerprint(fingerprint)) goto done;
+            strcpy(accepted_host_keys[accepted_host_key_count].host, host);
+            strcpy(accepted_host_keys[accepted_host_key_count].fingerprint, fingerprint);
+            accepted_host_key_count++; i += 3; continue;
+        }
+        goto done;
     }
+    if (separator < 0) goto done;
+    argc -= separator; argv += separator;
     if (argc < 2 || !read_exact(0, header, 4)) goto done;
     uint32_t length = ((uint32_t)header[0] << 24) | ((uint32_t)header[1] << 16) | ((uint32_t)header[2] << 8) | header[3];
     if (length > 1023 || !read_exact(0, password, length)) goto done;
@@ -206,9 +288,25 @@ int main(int argc, char **argv) {
             }
         }
         if (result) break;
+        if (used && could_be_hostkey_prompt(prompt, used)) {
+            static const char suffix[] = "(yes/no/[fingerprint])? ";
+            if (!ends_with(prompt, suffix)) {
+                if (time(NULL) - prompt_since >= 3) { result = UNSUPPORTED; break; }
+                continue;
+            }
+            if (!parse_hostkey_prompt(prompt, requested_host, sizeof(requested_host),
+                                      requested_fingerprint, sizeof(requested_fingerprint))) {
+                result = UNSUPPORTED; break;
+            }
+            if (accepted_hostkey(requested_host, requested_fingerprint)) {
+                if (!answer_yes(master)) { result = UNSUPPORTED; break; }
+                used = 0; prompt[0] = 0; prompt_since = 0;
+            } else {
+                result = HOSTKEY_REQUIRED; break;
+            }
+        }
         if (used && !auth.context) {
-            // Jump-host prompts, host-key confirmation and passphrases arrive before the
-            // final target's identity line. Never answer them.
+            // Jump-host prompts and passphrases arrive before final-target authentication.
             result = UNSUPPORTED; break;
         }
         if (used && !strcmp(prompt, id.prompt)) {
@@ -225,7 +323,8 @@ int main(int argc, char **argv) {
         pid_t exited = (!tty_open && !log_open) ? waitpid(child, &status, WNOHANG) : 0;
         if (exited == child) {
             child = -1;
-            result = used ? UNSUPPORTED : (auth.failed ? AUTH_FAILURE : (WIFEXITED(status) ? WEXITSTATUS(status) : 1));
+            result = used ? UNSUPPORTED : (auth.hostkey_failed ? HOSTKEY_FAILED :
+                     (auth.failed ? AUTH_FAILURE : (WIFEXITED(status) ? WEXITSTATUS(status) : 1)));
             break;
         }
     }
@@ -238,8 +337,10 @@ done:
     if (logs[0] >= 0) close(logs[0]);
     if (logs[1] >= 0) close(logs[1]);
     if (result == PASSWORD_REQUIRED) fputs("MTUNL_PASSWORD_REQUIRED\n", stderr);
+    else if (result == HOSTKEY_REQUIRED) fprintf(stderr, "MTUNL_HOSTKEY %s %s\n", requested_host, requested_fingerprint);
+    else if (result == HOSTKEY_FAILED) fputs("SSH host key verification failed\n", stderr);
     else if (result == AUTH_FAILURE) fputs("SSH authentication failed\n", stderr);
-    else if (result == UNSUPPORTED) fputs("SSH target identity or authentication prompt is ambiguous/unsupported\n", stderr);
+    else if (result == UNSUPPORTED) fputs("SSH target identity or authentication prompt is ambiguous/unsupported; encrypted keys may need ssh-add\n", stderr);
     else if (result) fputs("SSH connection ended\n", stderr);
     return stopping ? 0 : result;
 }

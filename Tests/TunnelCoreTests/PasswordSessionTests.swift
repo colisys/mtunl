@@ -8,6 +8,21 @@ final class PasswordSessionTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ControlRequest.self, from: JSONEncoder().encode(request))
         XCTAssertEqual(decoded.command, "startSession")
         XCTAssertEqual(ControlRequest(command: "start").command, "start")
+        let hostRequest = ControlRequest(command: "trustHostKey", target: "test", hostKeyRequestID: UUID())
+        let hostDecoded = try JSONDecoder().decode(ControlRequest.self, from: JSONEncoder().encode(hostRequest))
+        XCTAssertEqual(hostDecoded.hostKeyRequestID, hostRequest.hostKeyRequestID)
+    }
+
+    func testHostKeyEventParsesOnlyWellFormedFingerprint() {
+        let line = "MTUNL_HOSTKEY [example.com]:2222 SHA256:AbCdEf0123456789+/"
+        let key = SSHHostKey(event: line)
+        XCTAssertEqual(key?.host, "[example.com]:2222")
+        XCTAssertEqual(key?.fingerprint, "SHA256:AbCdEf0123456789+/")
+        XCTAssertEqual(SSHHostKey(event: "MTUNL_HOSTKEY [alias]:22 SHA256:AbCdEf0123456789+/")?.host, "[alias]:22")
+        for malformed in ["MTUNL_HOSTKEY host SHA256:", "MTUNL_HOSTKEY host MD5:1234",
+                          "MTUNL_HOSTKEY host SHA256:bad!", "MTUNL_HOSTKEY host name SHA256:abc"] {
+            XCTAssertNil(SSHHostKey(event: malformed), malformed)
+        }
     }
 
     func testTargetEventParsesOnlyWellFormedIdentity() {
@@ -137,6 +152,44 @@ final class PasswordSessionTests: XCTestCase {
                 XCTAssertNil(sup.statuses().first?.passwordRequestID)
             }
         }
+    }
+
+    func testUnknownHostKeyRequiresMatchingRequestAndTrustRelaunches() throws {
+        let fingerprint = "SHA256:AbCdEf0123456789+/"
+        let bridge = try fixture("if [ \"$1\" = --accept ]; then printf 'MTUNL_AUTHENTICATED\\n' >&2; exec /bin/sleep 2; fi\nprintf 'MTUNL_HOSTKEY [alias]:22 \(fingerprint)\\n' >&2\nexit 80")
+        defer { try? FileManager.default.removeItem(at: bridge) }
+        let sup = TunnelSupervisor(backoff: Backoff(base: 5, cap: 5), portInUse: { _, _ in false }, bridgePath: bridge.path)
+        defer { sup.shutdown() }
+        let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345)
+        sup.apply([config]); sup.start(config.id)
+        XCTAssertTrue(wait { sup.statuses().first?.hostKey != nil })
+        let challenge = try XCTUnwrap(sup.statuses().first?.hostKey)
+        XCTAssertEqual(challenge.host, "[alias]:22")
+        XCTAssertEqual(challenge.fingerprint, fingerprint)
+        XCTAssertFalse(sup.trustHostKey(config.id, requestID: UUID()))
+        XCTAssertTrue(sup.trustHostKey(config.id, requestID: challenge.requestID))
+        XCTAssertTrue(wait { sup.statuses().first?.state == .running })
+        sup.queue.sync {
+            let args = sup.entries[config.id]?.process?.arguments ?? []
+            XCTAssertTrue(args.starts(with: ["--accept", "[alias]:22", fingerprint, "--"]))
+            XCTAssertNil(sup.entries[config.id]?.hostKeyRequest)
+            XCTAssertEqual(sup.entries[config.id]?.acceptedHostKeys.count, 1)
+        }
+        sup.stop(config.id)
+        XCTAssertTrue(sup.queue.sync { sup.entries[config.id]?.acceptedHostKeys.isEmpty == true })
+    }
+
+    func testChangedHostKeyStopsWithoutRetryOrTrustRequest() throws {
+        let bridge = try fixture("printf 'SSH host key verification failed\\n' >&2\nexit 81")
+        defer { try? FileManager.default.removeItem(at: bridge) }
+        let sup = TunnelSupervisor(backoff: Backoff(base: 5, cap: 5), portInUse: { _, _ in false }, bridgePath: bridge.path)
+        defer { sup.shutdown() }
+        let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345)
+        sup.apply([config]); sup.start(config.id)
+        XCTAssertTrue(wait { sup.statuses().first?.state == .failed })
+        XCTAssertNil(sup.statuses().first?.hostKey)
+        XCTAssertEqual(sup.statuses().first?.restarts, 0)
+        XCTAssertTrue(sup.statuses().first?.message?.contains("指纹已变化") == true)
     }
 
     func testPasswordRequestWithoutObservedTargetIsRefused() throws {

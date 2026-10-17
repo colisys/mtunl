@@ -1,6 +1,26 @@
 import Foundation
 
-/// The final SSH destination the bridge observed in `ssh -v` output (`MTUNL_TARGET user host port`).
+/// A host key presented by the system SSH PTY before trust is established.
+struct SSHHostKey: Equatable {
+    let host: String
+    let fingerprint: String
+
+    init?(event line: String) {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "MTUNL_HOSTKEY",
+              !parts[1].isEmpty, parts[1].utf8.allSatisfy({
+                  ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) ||
+                  ".-_[]:".utf8.contains($0)
+              }), parts[2].hasPrefix("SHA256:"), parts[2].count > 7,
+              parts[2].dropFirst(7).utf8.allSatisfy({
+                  ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) || $0 == 43 || $0 == 47 || $0 == 61
+              }) else { return nil }
+        host = String(parts[1])
+        fingerprint = String(parts[2])
+    }
+}
+
+/// The final SSH destination observed in `MTUNL_TARGET user host port`.
 struct SSHTarget: Equatable {
     let user: String
     let host: String
@@ -42,8 +62,12 @@ public final class TunnelSupervisor: @unchecked Sendable {
         var oneTimePassword: String? // temporary password for this session only
         var sshTarget: SSHTarget? // identity the bridge last saw; binds any password to that target
         var passwordRequestID: UUID?
+        var hostKeyRequest: HostKeyChallenge?
+        var hostKeyEvent: SSHHostKey?
+        var acceptedHostKeys: [SSHHostKey] = []
         var usesBridge = false
         var eventBuffer = Data()
+        let pendingEventReads = DispatchGroup()
         init(config: TunnelConfig) { self.config = config }
     }
 
@@ -90,6 +114,9 @@ public final class TunnelSupervisor: @unchecked Sendable {
                     entry.oneTimePassword = nil
                     entry.passwordRequestID = nil
                     entry.sshTarget = nil
+                    entry.hostKeyRequest = nil
+                    entry.hostKeyEvent = nil
+                    entry.acceptedHostKeys.removeAll()
                     entry.config = config
                     if entry.desired { restartLocked(entry) }
                 } else {
@@ -125,6 +152,19 @@ public final class TunnelSupervisor: @unchecked Sendable {
         }
     }
 
+    public func trustHostKey(_ id: UUID, requestID: UUID?) -> Bool {
+        queue.sync {
+            guard let entry = entries[id], let requestID,
+                  let challenge = entry.hostKeyRequest, challenge.requestID == requestID,
+                  let key = entry.hostKeyEvent,
+                  key.host == challenge.host, key.fingerprint == challenge.fingerprint else { return false }
+            if !entry.acceptedHostKeys.contains(key) { entry.acceptedHostKeys.append(key) }
+            entry.hostKeyRequest = nil
+            startLocked(entry)
+            return true
+        }
+    }
+
     public func stop(_ id: UUID) { queue.sync { entries[id].map(stopLocked) } }
     public func restart(_ id: UUID) { queue.sync { entries[id].map(restartLocked) } }
     public func startAll() { queue.sync { orderedEntries.forEach(startLocked) } }
@@ -138,7 +178,8 @@ public final class TunnelSupervisor: @unchecked Sendable {
                     id: entry.config.id, name: entry.config.name, state: entry.state,
                     pid: entry.process.map { $0.processIdentifier }, message: entry.message,
                     restarts: entry.restarts, retryIn: entry.state == .waiting ? retryIn : nil,
-                    log: entry.log, passwordRequestID: entry.passwordRequestID
+                    log: entry.log, passwordRequestID: entry.passwordRequestID,
+                    hostKey: entry.hostKeyRequest
                 )
             }
         }

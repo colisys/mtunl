@@ -1,8 +1,8 @@
 import Foundation
 
 public enum ControlProtocol {
-    // Optional Mihomo status additions are backward compatible; do not force daemon restart.
-    public static let version = 2
+    // Host-key trust requests require a new daemon command and status field.
+    public static let version = 3
 }
 
 public enum TunnelState: String, Codable, Sendable {
@@ -13,6 +13,18 @@ public enum TunnelState: String, Codable, Sendable {
     case waiting
     /// Cannot run until the user fixes something (config error, missing tool).
     case failed
+}
+
+public struct HostKeyChallenge: Codable, Equatable, Sendable {
+    public var host: String
+    public var fingerprint: String
+    public var requestID: UUID
+
+    public init(host: String, fingerprint: String, requestID: UUID) {
+        self.host = host
+        self.fingerprint = fingerprint
+        self.requestID = requestID
+    }
 }
 
 public struct TunnelStatus: Codable, Equatable, Identifiable, Sendable {
@@ -27,10 +39,12 @@ public struct TunnelStatus: Codable, Equatable, Identifiable, Sendable {
     public var log: [String]
     /// Non-secret challenge issued only after actual final-target password fallback evidence.
     public var passwordRequestID: UUID?
+    public var hostKey: HostKeyChallenge?
 
     public init(
         id: UUID, name: String, state: TunnelState, pid: Int32? = nil, message: String? = nil,
-        restarts: Int = 0, retryIn: Int? = nil, log: [String] = [], passwordRequestID: UUID? = nil
+        restarts: Int = 0, retryIn: Int? = nil, log: [String] = [], passwordRequestID: UUID? = nil,
+        hostKey: HostKeyChallenge? = nil
     ) {
         self.id = id
         self.name = name
@@ -41,11 +55,12 @@ public struct TunnelStatus: Codable, Equatable, Identifiable, Sendable {
         self.retryIn = retryIn
         self.log = log
         self.passwordRequestID = passwordRequestID
+        self.hostKey = hostKey
     }
 }
 
 public struct ControlRequest: Codable, Sendable {
-    /// ping, status, start, stop, restart, startAll, stopAll, reload, shutdown
+    /// ping, status, start, stop, restart, trustHostKey, startAll, stopAll, reload, shutdown
     public var command: String
     /// A tunnel UUID or a unique name.
     public var target: String?
@@ -53,12 +68,15 @@ public struct ControlRequest: Codable, Sendable {
     /// Password starts use a new command so old daemons cannot fall back to argv transport.
     public var oneTimePassword: String?
     public var passwordRequestID: UUID?
+    public var hostKeyRequestID: UUID?
 
-    public init(command: String, target: String? = nil, oneTimePassword: String? = nil, passwordRequestID: UUID? = nil) {
+    public init(command: String, target: String? = nil, oneTimePassword: String? = nil,
+                passwordRequestID: UUID? = nil, hostKeyRequestID: UUID? = nil) {
         self.command = command == "start" && oneTimePassword != nil ? "startSession" : command
         self.target = target
         self.oneTimePassword = oneTimePassword
         self.passwordRequestID = passwordRequestID
+        self.hostKeyRequestID = hostKeyRequestID
     }
 }
 
