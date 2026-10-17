@@ -1,5 +1,21 @@
 import Foundation
 
+/// The final SSH destination the bridge observed in `ssh -v` output (`MTUNL_TARGET user host port`).
+struct SSHTarget: Equatable {
+    let user: String
+    let host: String
+    let port: String
+
+    init?(event line: String) {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 4, parts[0] == "MTUNL_TARGET", !parts[1].isEmpty, !parts[2].isEmpty,
+              let port = Int(parts[3]), (1...65535).contains(port) else { return nil }
+        user = String(parts[1])
+        host = String(parts[2])
+        self.port = String(port)
+    }
+}
+
 /// Keeps each desired tunnel running: launches the command, watches it, and
 /// retries with backoff. All mutable state lives on `queue`.
 public final class TunnelSupervisor: @unchecked Sendable {
@@ -24,6 +40,7 @@ public final class TunnelSupervisor: @unchecked Sendable {
         var retryTimer: DispatchSourceTimer?
         var runningTimer: DispatchSourceTimer?
         var oneTimePassword: String? // temporary password for this session only
+        var sshTarget: SSHTarget? // identity the bridge last saw; binds any password to that target
         var passwordRequestID: UUID?
         var usesBridge = false
         var eventBuffer = Data()
@@ -72,6 +89,7 @@ public final class TunnelSupervisor: @unchecked Sendable {
                     // Never carry a credential across destination/config changes.
                     entry.oneTimePassword = nil
                     entry.passwordRequestID = nil
+                    entry.sshTarget = nil
                     entry.config = config
                     if entry.desired { restartLocked(entry) }
                 } else {

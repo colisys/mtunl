@@ -20,6 +20,7 @@ extension TunnelSupervisor {
         entry.desired = false
         entry.oneTimePassword = nil
         entry.passwordRequestID = nil
+        entry.sshTarget = nil
         entry.relaunchNow = false
         entry.retryTimer?.cancel()
         entry.retryTimer = nil
@@ -92,6 +93,8 @@ extension TunnelSupervisor {
                 guard !bytes.isEmpty, bytes.count <= 1023, bytes.allSatisfy({ $0 >= 32 && $0 != 127 }) else {
                     throw CommandBuilderError.invalidSessionPassword
                 }
+                // Without an observed identity the bridge would refuse the password anyway; fail here instead.
+                guard entry.sshTarget != nil else { throw CommandBuilderError.unknownSSHTarget }
             }
         } catch {
             // Configuration or a missing tool: retrying cannot help.
@@ -108,7 +111,12 @@ extension TunnelSupervisor {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: useBridge ? bridgePath : command.executable)
-        process.arguments = command.arguments
+        var arguments = command.arguments
+        if useBridge, entry.oneTimePassword != nil, let target = entry.sshTarget {
+            // The bridge sends a password only when the identity ssh reports matches this exact target.
+            arguments = ["--expect", target.user, target.host, target.port, "--"] + arguments
+        }
+        process.arguments = arguments
         let secretPipe = useBridge ? Pipe() : nil
         process.standardInput = secretPipe.map { $0 as Any } ?? FileHandle.nullDevice
         // Bounded frame fits before spawning: no post-spawn write/SIGPIPE race.
@@ -176,6 +184,9 @@ extension TunnelSupervisor {
                 if line == "MTUNL_AUTHENTICATED", entry.process != nil, !entry.stopping, entry.desired {
                     entry.state = .running
                 }
+                if line.hasPrefix("MTUNL_TARGET "), let target = SSHTarget(event: line) {
+                    entry.sshTarget = target
+                }
                 // Never expose unrecognized helper output, even if a child echoes a secret.
             }
             if entry.eventBuffer.count > 4096 { entry.eventBuffer.removeAll() }
@@ -194,7 +205,7 @@ extension TunnelSupervisor {
         guard entry.generation == generation else { return }
         let uptime = entry.startedAt.map { Date().timeIntervalSince($0) } ?? 0
         cancelTimers(entry)
-        entry.errorPipe?.fileHandleForReading.readabilityHandler = nil
+        Self.finishStderr(entry)
         entry.errorPipe = nil
         entry.process = nil
         entry.stopping = false
@@ -208,12 +219,12 @@ extension TunnelSupervisor {
             entry.message = nil
             return
         }
-        if entry.usesBridge && status == 79 && !signaled && entry.oneTimePassword == nil {
+        if entry.usesBridge && status == 79 && !signaled && entry.oneTimePassword == nil && entry.sshTarget != nil {
             entry.desired = false
             entry.relaunchNow = false
             entry.state = .failed
             entry.passwordRequestID = UUID()
-            entry.message = "无可用密钥/agent，且服务器支持密码认证；等待输入登录密码"
+            entry.message = "密钥认证未通过，等待输入登录密码"
             return
         }
         // Check for authentication failure before honoring a pending restart.
@@ -226,7 +237,7 @@ extension TunnelSupervisor {
             entry.oneTimePassword = nil
             entry.desired = false
             entry.state = .failed
-            entry.message = status == 78 ? "认证提示不受支持或不确定；拒绝发送密码（请使用 agent/密钥）" : "认证失败，请重新输入密码"
+            entry.message = status == 78 || status == 79 ? "认证提示不明确，已拒绝发送密码（请改用密钥或 agent）" : "认证失败，请重新输入密码"
             return
         }
         
@@ -238,6 +249,22 @@ extension TunnelSupervisor {
         if uptime >= backoff.healthyUptime { entry.attempts = 0 }
         let reason = entry.log.last ?? (signaled ? "进程被信号终止（\(status)）" : "进程退出（代码 \(status)）")
         scheduleRetry(entry, reason: reason)
+    }
+
+    // The bridge has exited, but its last stderr events may still be queued behind the readability
+    // callback. Read them without blocking so a 79 always sees the target observed before its prompt.
+    private static func finishStderr(_ entry: Entry) {
+        guard let handle = entry.errorPipe?.fileHandleForReading else { return }
+        handle.readabilityHandler = nil
+        guard entry.usesBridge else { return }
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = read(fd, &chunk, chunk.count)
+            guard count > 0 else { break }
+            append(Data(chunk.prefix(count)), to: entry)
+        }
     }
 
     private func scheduleRetry(_ entry: Entry, reason: String) {

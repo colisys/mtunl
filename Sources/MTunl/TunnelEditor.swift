@@ -91,7 +91,7 @@ struct TunnelEditor: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("保留 SSH config / 跳板配置。密钥优先；密钥未成功或服务端不提供 publickey 时，仅最终目标明确支持 password 才请求密码；跳板须使用 agent/密钥，歧义提示拒绝。首次连接请独立核验主机指纹。")
+                    Text("沿用 SSH config 与跳板配置。先尝试密钥/agent，失败且目标支持密码时才询问；跳板仅用密钥/agent。首次连接请先在终端核验主机指纹。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

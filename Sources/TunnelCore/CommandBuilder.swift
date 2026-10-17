@@ -28,11 +28,13 @@ public enum CommandBuilderError: LocalizedError, Equatable {
     case toolNotFound(String)
 
     case invalidSessionPassword
+    case unknownSSHTarget
     public var errorDescription: String? {
         switch self {
         case .invalidSessionPassword: return "会话密码必须为 1–1023 字节 UTF-8，且不含控制字符"
 
         case .toolNotFound(let name): return "找不到 \(name)，请先安装（如 brew install \(name)）"
+        case .unknownSSHTarget: return "尚未确认 SSH 认证目标，拒绝发送密码"
         }
     }
 }

@@ -10,6 +10,18 @@ final class PasswordSessionTests: XCTestCase {
         XCTAssertEqual(ControlRequest(command: "start").command, "start")
     }
 
+    func testTargetEventParsesOnlyWellFormedIdentity() {
+        let target = SSHTarget(event: "MTUNL_TARGET root 178.83.203.20 22")
+        XCTAssertEqual(target, SSHTarget(event: "MTUNL_TARGET root 178.83.203.20 22"))
+        XCTAssertEqual(target?.user, "root")
+        XCTAssertEqual(target?.host, "178.83.203.20")
+        XCTAssertEqual(target?.port, "22")
+        for malformed in ["MTUNL_TARGET  host 22", "MTUNL_TARGET root host 0", "MTUNL_TARGET root host 70000",
+                          "MTUNL_TARGET root host 22 extra", "MTUNL_TARGET root host", "MTUNL_AUTHENTICATED"] {
+            XCTAssertNil(SSHTarget(event: malformed), malformed)
+        }
+    }
+
     private func wait(_ condition: () -> Bool) -> Bool {
         let end = Date().addingTimeInterval(4)
         while Date() < end {
@@ -19,7 +31,8 @@ final class PasswordSessionTests: XCTestCase {
         return condition()
     }
 
-    // Lifecycle-only fake bridge ignores stdin; real pipe/PTY transport is tested offline in Python.
+    // Fake bridge: the first run (no --expect) reports a target and asks for a password; a
+    // password run (--expect first) behaves per `body`. Real pipe/PTY transport is tested offline in Python.
     private func fixture(_ body: String) throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("mtunl-fixture-\(UUID())")
         try Data(("#!/bin/sh\n/usr/bin/true\n" + body + "\n").utf8).write(to: url)
@@ -27,19 +40,30 @@ final class PasswordSessionTests: XCTestCase {
         return url
     }
 
+    private func passwordConfig(host: String = "alias") -> TunnelConfig {
+        TunnelConfig(name: "test", kind: .dynamic, host: host, listenPort: 12345, sshAuthMethod: .password)
+    }
+
+    private func requestPassword(_ sup: TunnelSupervisor, _ config: TunnelConfig, secret: String) throws {
+        sup.apply([config]); sup.start(config.id)
+        XCTAssertTrue(wait { sup.statuses().first?.passwordRequestID != nil })
+        let token = try XCTUnwrap(sup.statuses().first?.passwordRequestID)
+        XCTAssertTrue(sup.supplyPassword(config.id, requestID: token, password: secret))
+    }
+
     func testCredentialSurvivesRunningAndReconnectThenStopClears() throws {
-        let bridge = try fixture("printf 'MTUNL_AUTHENTICATED\\n' >&2\nexec /bin/sleep 0.2")
+        let bridge = try fixture("if [ \"$1\" = --expect ]; then printf 'MTUNL_AUTHENTICATED\\n' >&2; exec /bin/sleep 0.2; fi\nprintf 'MTUNL_TARGET root alias 22\\n' >&2\nexit 79")
         defer { try? FileManager.default.removeItem(at: bridge) }
         let sup = TunnelSupervisor(backoff: Backoff(base: 0.02, cap: 0.02), stableAfter: 0.01,
                                    portInUse: { _, _ in false }, bridgePath: bridge.path)
         defer { sup.shutdown() }
-        let config = TunnelConfig(name: "test", kind: .dynamic, host: "example.invalid", listenPort: 12345)
+        let config = passwordConfig()
         let secret = UUID().uuidString
-        sup.apply([config]); sup.start(config.id, oneTimePassword: secret)
+        try requestPassword(sup, config, secret: secret)
         XCTAssertTrue(wait { sup.statuses().first?.state == .running })
         XCTAssertEqual(sup.queue.sync { sup.entries[config.id]?.oneTimePassword }, secret)
         // Repeated starts must not erase the active session credential.
-        sup.start(config.id, oneTimePassword: nil)
+        sup.start(config.id)
         XCTAssertTrue(wait { (sup.statuses().first?.restarts ?? 0) >= 2 })
         XCTAssertEqual(sup.queue.sync { sup.entries[config.id]?.oneTimePassword }, secret)
         sup.restart(config.id)
@@ -48,17 +72,18 @@ final class PasswordSessionTests: XCTestCase {
         XCTAssertFalse(String(decoding: status, as: UTF8.self).contains(secret))
         sup.stop(config.id)
         XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.oneTimePassword })
+        XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.sshTarget })
     }
 
     func testAuthenticationAndUnsupportedPromptClearWithoutRetry() throws {
         for code in [77, 78] {
-            let bridge = try fixture("exit \(code)")
+            let bridge = try fixture("if [ \"$1\" = --expect ]; then exit \(code); fi\nprintf 'MTUNL_TARGET root alias 22\\n' >&2\nexit 79")
             defer { try? FileManager.default.removeItem(at: bridge) }
             let sup = TunnelSupervisor(stableAfter: 0.01, portInUse: { _, _ in false }, bridgePath: bridge.path)
             defer { sup.shutdown() }
-            let config = TunnelConfig(name: "test", kind: .dynamic, host: "example.invalid", listenPort: 12345)
-            sup.apply([config]); sup.start(config.id, oneTimePassword: UUID().uuidString)
-            XCTAssertTrue(wait { sup.statuses().first?.state == .failed })
+            let config = passwordConfig()
+            try requestPassword(sup, config, secret: UUID().uuidString)
+            XCTAssertTrue(wait { sup.statuses().first?.state == .failed && sup.statuses().first?.passwordRequestID == nil })
             XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.oneTimePassword })
             XCTAssertEqual(sup.statuses().first?.restarts, 0)
         }
@@ -66,8 +91,10 @@ final class PasswordSessionTests: XCTestCase {
 
     func testRemovalCancelsWaitingSessionAndClearsCapturedEntry() {
         let sup = TunnelSupervisor(portInUse: { _, _ in true }, bridgePath: "/usr/bin/true")
-        let config = TunnelConfig(name: "test", kind: .dynamic, host: "example.invalid", listenPort: 12345)
-        sup.apply([config]); sup.start(config.id, oneTimePassword: UUID().uuidString)
+        let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345)
+        sup.apply([config])
+        sup.queue.sync { sup.entries[config.id]?.sshTarget = SSHTarget(event: "MTUNL_TARGET root alias 22") }
+        sup.start(config.id, oneTimePassword: UUID().uuidString)
         let entry = sup.queue.sync { sup.entries[config.id]! }
         XCTAssertEqual(sup.statuses().first?.state, .waiting)
         sup.apply([])
@@ -78,24 +105,27 @@ final class PasswordSessionTests: XCTestCase {
         }
     }
 
-    func testConfigChangeClearsWaitingCredential() {
+    func testConfigChangeClearsWaitingCredentialAndObservedTarget() {
         let sup = TunnelSupervisor(portInUse: { _, _ in true }, bridgePath: "/usr/bin/true")
         defer { sup.shutdown() }
-        var config = TunnelConfig(name: "test", kind: .dynamic, host: "example.invalid", listenPort: 12345)
-        sup.apply([config]); sup.start(config.id, oneTimePassword: UUID().uuidString)
+        var config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345)
+        sup.apply([config])
+        sup.queue.sync { sup.entries[config.id]?.sshTarget = SSHTarget(event: "MTUNL_TARGET root alias 22") }
+        sup.start(config.id, oneTimePassword: UUID().uuidString)
         XCTAssertNotNil(sup.queue.sync { sup.entries[config.id]?.oneTimePassword })
         config.host = "other.invalid"
         sup.apply([config])
         XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.oneTimePassword })
+        XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.sshTarget })
     }
 
     func testOnlyExplicitPasswordRequirementIssuesUIChallenge() throws {
         for code in [79, 77, 78, 255] {
-            let bridge = try fixture("exit \(code)")
+            let bridge = try fixture("printf 'MTUNL_TARGET root alias 22\\n' >&2\nexit \(code)")
             defer { try? FileManager.default.removeItem(at: bridge) }
             let sup = TunnelSupervisor(backoff: Backoff(base: 5, cap: 5), portInUse: { _, _ in false }, bridgePath: bridge.path)
             defer { sup.shutdown() }
-            let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345, sshAuthMethod: .password)
+            let config = passwordConfig()
             sup.apply([config]); sup.start(config.id)
             XCTAssertTrue(wait { sup.statuses().first?.state != .starting })
             XCTAssertEqual(sup.statuses().first?.passwordRequestID != nil, code == 79)
@@ -109,23 +139,44 @@ final class PasswordSessionTests: XCTestCase {
         }
     }
 
-    func testPasswordCanBeSuppliedAndIsNeverLeakedToArguments() throws {
-        let bridge = try fixture("/bin/sleep 0.1\nexit 79")
+    func testPasswordRequestWithoutObservedTargetIsRefused() throws {
+        let bridge = try fixture("exit 79")
+        defer { try? FileManager.default.removeItem(at: bridge) }
+        let sup = TunnelSupervisor(backoff: Backoff(base: 5, cap: 5), portInUse: { _, _ in false }, bridgePath: bridge.path)
+        defer { sup.shutdown() }
+        let config = passwordConfig()
+        sup.apply([config]); sup.start(config.id)
+        XCTAssertTrue(wait { sup.statuses().first?.state == .failed })
+        XCTAssertNil(sup.statuses().first?.passwordRequestID)
+    }
+
+    func testPasswordIsBoundToObservedTargetAndNeverLeakedToArguments() throws {
+        let bridge = try fixture("if [ \"$1\" = --expect ]; then exec /bin/sleep 5; fi\nprintf 'MTUNL_TARGET root alias 22\\n' >&2\nexit 79")
         defer { try? FileManager.default.removeItem(at: bridge) }
         let sup = TunnelSupervisor(portInUse: { _, _ in false }, bridgePath: bridge.path)
         defer { sup.shutdown() }
-        let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345, sshAuthMethod: .password)
-        sup.apply([config]); sup.start(config.id)
-        XCTAssertTrue(wait { sup.statuses().first?.passwordRequestID != nil })
-        let token = try XCTUnwrap(sup.statuses().first?.passwordRequestID)
+        let config = passwordConfig()
         let secret = UUID().uuidString
-        XCTAssertTrue(sup.supplyPassword(config.id, requestID: token, password: secret))
-        XCTAssertFalse(sup.supplyPassword(config.id, requestID: token, password: secret))
+        try requestPassword(sup, config, secret: secret)
+        XCTAssertFalse(sup.supplyPassword(config.id, requestID: UUID(), password: secret))
+        XCTAssertTrue(wait { sup.queue.sync { sup.entries[config.id]?.process != nil } })
         sup.queue.sync {
-            let entry = sup.entries[config.id]!
-            XCTAssertFalse(entry.process?.arguments?.contains(secret) ?? true)
+            let arguments = sup.entries[config.id]?.process?.arguments ?? []
+            XCTAssertEqual(Array(arguments.prefix(5)), ["--expect", "root", "alias", "22", "--"])
+            XCTAssertFalse(arguments.contains(secret))
         }
         sup.stop(config.id)
+        XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.sshTarget })
+    }
+
+    func testPasswordStartWithoutObservedTargetFailsClosed() {
+        let sup = TunnelSupervisor(portInUse: { _, _ in false }, bridgePath: "/usr/bin/true")
+        defer { sup.shutdown() }
+        let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345)
+        sup.apply([config]); sup.start(config.id, oneTimePassword: UUID().uuidString)
+        XCTAssertEqual(sup.statuses().first?.state, .failed)
+        XCTAssertNil(sup.queue.sync { sup.entries[config.id]?.oneTimePassword })
+        XCTAssertNil(sup.statuses().first?.pid)
     }
 
     func testSSHSurvivalDoesNotMeanAuthenticationAndEventsAreFramed() throws {
@@ -133,7 +184,7 @@ final class PasswordSessionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: bridge) }
         let sup = TunnelSupervisor(stableAfter: 0.01, portInUse: { _, _ in false }, bridgePath: bridge.path)
         defer { sup.shutdown() }
-        let config = TunnelConfig(name: "test", kind: .dynamic, host: "alias", listenPort: 12345, sshAuthMethod: .password)
+        let config = passwordConfig()
         sup.apply([config]); sup.start(config.id)
         usleep(100_000)
         XCTAssertEqual(sup.statuses().first?.state, .starting)

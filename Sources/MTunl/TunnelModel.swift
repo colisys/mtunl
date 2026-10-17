@@ -109,7 +109,7 @@ final class TunnelModel: ObservableObject {
         defer { passwordAlertOpen = false }
         let alert = NSAlert()
         alert.messageText = "目标 SSH 需要登录密码"
-        alert.informativeText = "\(status.name)：密钥认证未成功或服务端明确不提供 publickey，且最终目标明确提供 password 认证。此密码不会用于跳板或私钥口令。仅在当前会话内存缓存至停止或认证失败。"
+        alert.informativeText = "\(status.name) 的密钥认证未通过，服务器支持密码登录。密码仅保存在内存中，停止或认证失败后清除。"
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         alert.accessoryView = field
         alert.addButton(withTitle: "继续认证")
