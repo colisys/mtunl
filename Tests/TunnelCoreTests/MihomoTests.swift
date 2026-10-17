@@ -149,41 +149,63 @@ final class MihomoTests: XCTestCase {
                      bindAddress: "127.0.0.1", listenPort: 1080)
     }
 
-    func testYamlUsesSSHLocalSocksPortAndCIDRs() throws {
-        let settings = MihomoSettings(dynamicTunnelID: dynamic().id,
-                                      cidrs: ["10.0.0.0/8", "2001:db8::/32"], mixedPort: 17890)
+    func testYamlUsesGeneralRulesAndSelectedSSHOutbound() throws {
+        let settings = MihomoSettings(dynamicTunnelID: dynamic().id, rules: [
+            "IP-CIDR,10.0.0.0/8,no-resolve",
+            "IP-CIDR6,2001:db8::/32,no-resolve",
+            "DOMAIN-SUFFIX,example.com",
+            "GEOSITE,geolocation-!cn",
+            "DST-PORT,443",
+            "PROCESS-NAME,Telegram",
+            "AND,((NETWORK,UDP),(DST-PORT,443))"
+        ], mixedPort: 17890)
         let yaml = try MihomoConfigBuilder.yaml(settings: settings, socksPort: 1080)
         XCTAssertTrue(yaml.contains("server: 127.0.0.1"))
         XCTAssertTrue(yaml.contains("port: 1080"))
         XCTAssertTrue(yaml.contains("udp: false"))
-        XCTAssertTrue(yaml.contains("IP-CIDR,10.0.0.0/8,MTunl SSH Group"))
-        XCTAssertTrue(yaml.contains("IP-CIDR6,2001:db8::/32,MTunl SSH Group"))
+        XCTAssertTrue(yaml.contains("- \"IP-CIDR,10.0.0.0/8,MTunl SSH Group,no-resolve\""))
+        XCTAssertTrue(yaml.contains("- \"IP-CIDR6,2001:db8::/32,MTunl SSH Group,no-resolve\""))
+        XCTAssertTrue(yaml.contains("- \"DOMAIN-SUFFIX,example.com,MTunl SSH Group\""))
+        XCTAssertTrue(yaml.contains("- \"GEOSITE,geolocation-!cn,MTunl SSH Group\""))
+        XCTAssertTrue(yaml.contains("- \"DST-PORT,443,MTunl SSH Group\""))
+        XCTAssertTrue(yaml.contains("- \"PROCESS-NAME,Telegram,MTunl SSH Group\""))
+        XCTAssertTrue(yaml.contains("- \"AND,((NETWORK,UDP),(DST-PORT,443)),MTunl SSH Group\""))
+        XCTAssertTrue(yaml.contains("- MATCH,DIRECT"))
         XCTAssertTrue(yaml.contains("auto-route: true"))
         XCTAssertTrue(yaml.contains("name: MTunl SSH Group"))
-        XCTAssertFalse(yaml.contains("name: MTunl SSH\n            type: select"))
     }
 
-    func testValidationRequiresDynamicTunnelAndCIDR() throws {
+    func testValidationRequiresDynamicTunnelAndSafeRules() throws {
         let tunnel = dynamic()
-        let settings = MihomoSettings(dynamicTunnelID: tunnel.id, cidrs: ["10.0.0.0/8"])
+        let settings = MihomoSettings(dynamicTunnelID: tunnel.id, rules: ["DOMAIN-SUFFIX,example.com"])
         XCTAssertThrowsError(try MihomoConfigBuilder.validate(settings, tunnels: [
             tunnel.withKind(.local)
         ])) { error in
             XCTAssertEqual(error as? MihomoError, .tunnelMustBeDynamic)
         }
-        XCTAssertThrowsError(try MihomoConfigBuilder.validate(
-            MihomoSettings(dynamicTunnelID: tunnel.id, cidrs: ["not-cidr"]), tunnels: [tunnel]
-        ))
+        for invalid in [[], ["DOMAIN-SUFFIX,"], ["DOMAIN,example.com,DIRECT"], ["MATCH,DIRECT"],
+                        ["DOMAIN,example.com\nexternal-controller: 0.0.0.0:80"], ["DOMAIN,,example.com"]] {
+            XCTAssertThrowsError(try MihomoConfigBuilder.validate(
+                MihomoSettings(dynamicTunnelID: tunnel.id, rules: invalid), tunnels: [tunnel]
+            ), "\(invalid)")
+        }
         XCTAssertNoThrow(try MihomoConfigBuilder.validate(
-            MihomoSettings(dynamicTunnelID: tunnel.id, cidrs: ["2001:db8::/32"]), tunnels: [tunnel]
-        ))
-        XCTAssertThrowsError(try MihomoConfigBuilder.validate(
-            MihomoSettings(dynamicTunnelID: tunnel.id, cidrs: ["2001:db8::/129"]), tunnels: [tunnel]
+            MihomoSettings(dynamicTunnelID: tunnel.id, rules: ["IP-CIDR,10.0.0.0/8,no-resolve", "IP-CIDR6,2001:db8::/32"]),
+            tunnels: [tunnel]
         ))
     }
 
+    func testLegacyCIDRSettingsMigrateToGeneralRules() throws {
+        let old = #"{"cidrs":["10.0.0.0/8","2001:db8::/32"]}"#
+        let settings = try JSONDecoder().decode(MihomoSettings.self, from: Data(old.utf8))
+        XCTAssertEqual(settings.rules, ["IP-CIDR,10.0.0.0/8,no-resolve", "IP-CIDR6,2001:db8::/32,no-resolve"])
+        let saved = String(decoding: try JSONEncoder().encode(settings), as: UTF8.self)
+        XCTAssertTrue(saved.contains("\"rules\""))
+        XCTAssertFalse(saved.contains("\"cidrs\""))
+    }
+
     func testMissingTunnelIsRejected() {
-        let settings = MihomoSettings(dynamicTunnelID: UUID(), cidrs: ["10.0.0.0/8"])
+        let settings = MihomoSettings(dynamicTunnelID: UUID(), rules: ["IP-CIDR,10.0.0.0/8"])
         XCTAssertThrowsError(try MihomoConfigBuilder.validate(settings, tunnels: [])) { error in
             XCTAssertEqual(error as? MihomoError, .tunnelNotFound)
         }

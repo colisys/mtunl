@@ -6,7 +6,7 @@ struct MihomoPanel: View {
     @ObservedObject var model: TunnelModel
     @State private var path: String
     @State private var mirror: String
-    @State private var cidrs: String
+    @State private var rulesText: String
     @State private var mixedPort: String
     @State private var selectedTunnel: UUID?
     @State private var expanded = false
@@ -16,7 +16,7 @@ struct MihomoPanel: View {
         let settings = model.mihomoSettings
         _path = State(initialValue: settings.binaryPath)
         _mirror = State(initialValue: settings.mirrorURL)
-        _cidrs = State(initialValue: settings.cidrs.joined(separator: ", "))
+        _rulesText = State(initialValue: settings.rules.joined(separator: "\n"))
         _mixedPort = State(initialValue: String(settings.mixedPort))
         _selectedTunnel = State(initialValue: settings.dynamicTunnelID)
     }
@@ -81,8 +81,22 @@ struct MihomoPanel: View {
                         }
                     }
                     .labelsHidden().controlSize(.small)
-                    TextField("CIDR 网段（逗号分隔，如 10.0.0.0/8, 2001:db8::/32）", text: $cidrs)
-                        .textFieldStyle(.roundedBorder).controlSize(.small)
+                    Text("Mihomo 规则（每行一条，不写出口策略）").font(.caption2).foregroundStyle(.secondary)
+                    TextEditor(text: $rulesText)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(height: 76)
+                        .overlay(alignment: .topLeading) {
+                            if rulesText.isEmpty {
+                                Text("DOMAIN-SUFFIX,example.com\nGEOSITE,geolocation-!cn\nIP-CIDR,10.0.0.0/8")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.horizontal, 5).padding(.vertical, 7)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(.quaternary))
+                    Text("匹配规则自动走所选 SSH 出口；未匹配流量直连。")
+                        .font(.caption2).foregroundStyle(.secondary)
                     HStack(spacing: 6) {
                         Text("混合端口").font(.caption2).foregroundStyle(.secondary)
                         TextField("17890", text: $mixedPort).textFieldStyle(.roundedBorder).frame(width: 64)
@@ -125,7 +139,7 @@ struct MihomoPanel: View {
                 .padding(.leading, 16)
                 .onChange(of: path) { _ in save() }
                 .onChange(of: mirror) { _ in save() }
-                .onChange(of: cidrs) { _ in save() }
+                .onChange(of: rulesText) { _ in save() }
                 .onChange(of: mixedPort) { _ in save() }
                 .onChange(of: selectedTunnel) { _ in save() }
             }
@@ -146,13 +160,15 @@ struct MihomoPanel: View {
     }
 
     private func save() {
-        let values = cidrs.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let values = rulesText.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         let settings = MihomoSettings(
             enabled: true,
             binaryPath: path.trimmingCharacters(in: .whitespacesAndNewlines),
             mirrorURL: mirror.trimmingCharacters(in: .whitespacesAndNewlines),
             dynamicTunnelID: selectedTunnel,
-            cidrs: values,
+            rules: values,
             mixedPort: Int(mixedPort) ?? 17890,
             controllerPort: model.mihomoSettings.controllerPort,
             autoRoute: true

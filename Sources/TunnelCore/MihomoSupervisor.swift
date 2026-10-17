@@ -49,7 +49,7 @@ public final class MihomoSupervisor: @unchecked Sendable {
         operations.async { [self] in
             do {
                 let dynamic = try MihomoConfigBuilder.validate(settings, tunnels: tunnels)
-                let config = HelperConfiguration(cidrs: settings.cidrs, mixedPort: settings.mixedPort,
+                let config = HelperConfiguration(rules: settings.rules, mixedPort: settings.mixedPort,
                     controllerPort: settings.controllerPort, socksPort: dynamic.listenPort, autoRoute: settings.autoRoute)
                 _ = try config.yaml()
                 let binary = URL(fileURLWithPath: try kernelManager.resolveBinary(override: settings.binaryPath.isEmpty ? nil : settings.binaryPath).path)

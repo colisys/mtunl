@@ -38,19 +38,19 @@ final class WatchedMihomoProcess {
 }
 
 struct HelperConfiguration: Codable {
-    var cidrs: [String]
+    var rules: [String]
     var mixedPort: Int
     var controllerPort: Int
     var socksPort: Int
     var autoRoute: Bool
 
     func yaml() throws -> String {
-        guard cidrs.count <= 256, (1024...65535).contains(socksPort),
+        guard rules.count <= 256, (1024...65535).contains(socksPort),
               socksPort != mixedPort, socksPort != controllerPort else {
-            throw MihomoError.invalid("Invalid helper ports or CIDR count")
+            throw MihomoError.invalid("Invalid helper ports or rule count")
         }
         let tunnel = TunnelConfig(name: "helper", kind: .dynamic, host: "localhost", user: "unused", bindAddress: "127.0.0.1", listenPort: socksPort)
-        let settings = MihomoSettings(dynamicTunnelID: tunnel.id, cidrs: cidrs, mixedPort: mixedPort, controllerPort: controllerPort, autoRoute: autoRoute)
+        let settings = MihomoSettings(dynamicTunnelID: tunnel.id, rules: rules, mixedPort: mixedPort, controllerPort: controllerPort, autoRoute: autoRoute)
         _ = try MihomoConfigBuilder.validate(settings, tunnels: [tunnel])
         return try MihomoConfigBuilder.yaml(settings: settings, socksPort: socksPort)
     }

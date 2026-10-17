@@ -7,13 +7,14 @@ public struct MihomoSettings: Codable, Equatable, Sendable {
     /// Optional HTTPS prefix prepended to the complete upstream URL (metadata and assets).
     public var mirrorURL: String
     public var dynamicTunnelID: UUID?
-    public var cidrs: [String]
+    /// Mihomo rule expressions without an outbound; matching traffic uses the selected SSH proxy.
+    public var rules: [String]
     public var mixedPort: Int
     public var controllerPort: Int
     public var autoRoute: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, binaryPath, mirrorURL, dynamicTunnelID, cidrs, mixedPort, controllerPort, autoRoute
+        case enabled, binaryPath, mirrorURL, dynamicTunnelID, rules, cidrs, mixedPort, controllerPort, autoRoute
     }
 
     public init(from decoder: Decoder) throws {
@@ -22,10 +23,28 @@ public struct MihomoSettings: Codable, Equatable, Sendable {
         binaryPath = try container.decodeIfPresent(String.self, forKey: .binaryPath) ?? ""
         mirrorURL = try container.decodeIfPresent(String.self, forKey: .mirrorURL) ?? ""
         dynamicTunnelID = try container.decodeIfPresent(UUID.self, forKey: .dynamicTunnelID)
-        cidrs = try container.decodeIfPresent([String].self, forKey: .cidrs) ?? []
+        if let rules = try container.decodeIfPresent([String].self, forKey: .rules) {
+            self.rules = rules
+        } else {
+            self.rules = (try container.decodeIfPresent([String].self, forKey: .cidrs) ?? []).map {
+                "\($0.contains(":") ? "IP-CIDR6" : "IP-CIDR"),\($0),no-resolve"
+            }
+        }
         mixedPort = try container.decodeIfPresent(Int.self, forKey: .mixedPort) ?? 17890
         controllerPort = try container.decodeIfPresent(Int.self, forKey: .controllerPort) ?? 19090
         autoRoute = try container.decodeIfPresent(Bool.self, forKey: .autoRoute) ?? true
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(binaryPath, forKey: .binaryPath)
+        try container.encode(mirrorURL, forKey: .mirrorURL)
+        try container.encodeIfPresent(dynamicTunnelID, forKey: .dynamicTunnelID)
+        try container.encode(rules, forKey: .rules)
+        try container.encode(mixedPort, forKey: .mixedPort)
+        try container.encode(controllerPort, forKey: .controllerPort)
+        try container.encode(autoRoute, forKey: .autoRoute)
     }
 
     public init(
@@ -33,7 +52,7 @@ public struct MihomoSettings: Codable, Equatable, Sendable {
         binaryPath: String = "",
         mirrorURL: String = "",
         dynamicTunnelID: UUID? = nil,
-        cidrs: [String] = [],
+        rules: [String] = [],
         mixedPort: Int = 17890,
         controllerPort: Int = 19090,
         autoRoute: Bool = true
@@ -42,7 +61,7 @@ public struct MihomoSettings: Codable, Equatable, Sendable {
         self.binaryPath = binaryPath
         self.mirrorURL = mirrorURL
         self.dynamicTunnelID = dynamicTunnelID
-        self.cidrs = cidrs
+        self.rules = rules
         self.mixedPort = mixedPort
         self.controllerPort = controllerPort
         self.autoRoute = autoRoute
@@ -116,8 +135,7 @@ public enum MihomoConfigBuilder {
               settings.mixedPort != settings.controllerPort else {
             throw MihomoError.invalid("Mihomo 端口必须在 1024–65535 之间且不能相同")
         }
-        guard !settings.cidrs.isEmpty else { throw MihomoError.invalid("至少需要一个内网 CIDR 网段") }
-        guard settings.cidrs.allSatisfy(validCIDR) else { throw MihomoError.invalid("内网 CIDR 网段格式无效") }
+        _ = try normalizedRules(settings.rules)
         guard let id = settings.dynamicTunnelID,
               let tunnel = tunnels.first(where: { $0.id == id }) else { throw MihomoError.tunnelNotFound }
         guard tunnel.kind == .dynamic else { throw MihomoError.tunnelMustBeDynamic }
@@ -125,10 +143,12 @@ public enum MihomoConfigBuilder {
     }
 
     public static func yaml(settings: MihomoSettings, socksAddress: String = "127.0.0.1", socksPort: Int) throws -> String {
-        guard !settings.cidrs.isEmpty else { throw MihomoError.invalid("至少需要一个内网 CIDR 网段") }
-        let rules = settings.cidrs.map { cidr in
-            let ruleType = cidr.contains(":") ? "IP-CIDR6" : "IP-CIDR"
-            return "  - \(ruleType),\(cidr),MTunl SSH Group,no-resolve"
+        let rules = try normalizedRules(settings.rules).map { rule in
+            let parts = rule.split(separator: ",", omittingEmptySubsequences: false)
+            let noResolve = parts.last?.lowercased() == "no-resolve" && parts.count > 1
+            let match = noResolve ? parts.dropLast().joined(separator: ",") : rule
+            let value = match + ",MTunl SSH Group" + (noResolve ? ",no-resolve" : "")
+            return "  - \(yamlString(value))"
         }.joined(separator: "\n")
         let autoRoute = settings.autoRoute ? "true" : "false"
         return """
@@ -163,18 +183,46 @@ public enum MihomoConfigBuilder {
         """
     }
 
-    private static func validCIDR(_ value: String) -> Bool {
-        let parts = value.split(separator: "/", omittingEmptySubsequences: false)
-        guard parts.count == 2, let prefix = Int(parts[1]) else { return false }
-        if value.contains(":") {
-            return (0...128).contains(prefix) && IPv6Address(String(parts[0])) != nil
+    private static func normalizedRules(_ values: [String]) throws -> [String] {
+        guard !values.isEmpty, values.count <= 256,
+              values.allSatisfy({ $0.utf8.count <= 4096 }) else {
+            throw MihomoError.invalid("请填写 1–256 条 Mihomo 规则，每条不超过 4096 字节")
         }
-        guard (0...32).contains(prefix) else { return false }
-        let octets = parts[0].split(separator: ".")
-        return octets.count == 4 && octets.allSatisfy { octet in
-            guard let number = Int(octet) else { return false }
-            return (0...255).contains(number)
+        let rules = values.compactMap(normalizedRule)
+        guard rules.count == values.count else {
+            throw MihomoError.invalid("规则格式无效：每行填写 Mihomo 匹配规则，不要填写出口策略")
         }
+        return rules
+    }
+
+    private static func normalizedRule(_ value: String) -> String? {
+        let expression = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !expression.isEmpty,
+              !expression.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              let comma = expression.firstIndex(of: ",") else {
+            return expression.uppercased() == "MATCH" ? "MATCH" : nil
+        }
+        let type = expression[..<comma].trimmingCharacters(in: .whitespaces)
+        let matcher = expression[expression.index(after: comma)...].trimmingCharacters(in: .whitespaces)
+        let actions: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "REJECT-TINYRST", "PASS", "COMPATIBLE", "GLOBAL", "MTUNL SSH GROUP"]
+        let fields = matcher.split(separator: ",", omittingEmptySubsequences: false)
+        guard let last = fields.last else { return nil }
+        let finalField = last.trimmingCharacters(in: .whitespaces).uppercased()
+        guard !type.isEmpty, type.utf8.count <= 64,
+              type.utf8.allSatisfy({
+                  ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) ||
+                  ($0 >= 48 && $0 <= 57) || $0 == 45 || $0 == 95
+              }),
+              type.uppercased() != "MATCH", !matcher.isEmpty, !matcher.hasPrefix(","),
+              !matcher.contains(",,"), !matcher.hasSuffix(","),
+              !actions.contains(finalField) else { return nil }
+        return "\(type.uppercased()),\(matcher)"
+    }
+
+    private static func yamlString(_ value: String) -> String {
+        let escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 }
 

@@ -8,7 +8,7 @@ macOS 菜单栏 SSH 隧道管理工具。只包装系统 `/usr/bin/ssh`（以及
 - 远程转发 `-R`（本地 → 远程）：把本机可访问的服务转发到远程主机端口。
 - 动态转发 `-D`（本地 → 远程）：在本机打开 SOCKS5 代理，流量经 SSH 连接从远程主机访问网络。
 - socat 中继（本地 → 目标）：在本机监听 TCP 端口，并转发到另一个 TCP 地址（需自行安装 `socat`，如 `brew install socat`）。
-- Mihomo TUN 流量接管：可选择现有动态 SSH 隧道作为 SOCKS5 出口，并指定需要接管的 IPv4 / IPv6 CIDR 网段。IPv4 使用 `IP-CIDR` 规则，IPv6 使用 `IP-CIDR6` 规则。下载与启动独立：先点击“下载内核”，缓存存在时按钮变为“更新内核”。更新检查最新 release tag；同 tag 且缓存可执行、`-v` 验证成功则不下载资产。启动始终不联网，本地路径优先，否则使用缓存。启动后通过 argv `-v` 查询实际版本（2 秒、16 KiB 上限），与缓存 release tag 分开显示。更新写入独立目录，不覆盖正在运行的二进制；更换已授权快照需要先停止 Mihomo，再重置 helper 授权。可配置 HTTPS 镜像前缀；镜像必须同时代理 Releases API JSON 和资产下载，留空使用 GitHub。
+- Mihomo TUN 流量接管：选择动态 SSH 隧道作为 SOCKS5 出口，逐行填写 Mihomo 匹配规则（域名、Geo、IP/CIDR、端口、进程及复合规则）；命中流量走 SSH，未匹配流量直连。旧 CIDR 配置自动迁移。内核下载与启动独立，支持缓存、版本显示和可选 HTTPS 镜像。
 - 隧道配置保存在 `~/Library/Application Support/MTunl/tunnels.json`（权限 600）。私钥只存路径。
 - 断线自动重连（1、2、4… 秒，最长 30 秒）；本地端口被占用时显示原因并重试。
 - 守护进程 `mtunlctl serve` 独立于菜单栏界面运行，关闭界面不会断开隧道。
@@ -57,8 +57,8 @@ TUN 需要创建系统虚拟网卡并修改路由。首次启动通过 `osascrip
 ### Privileged helper 会话与限制
 
 - `mtunl-helper` 仅以 root 运行；用户 daemon / client 拒绝 root。helper socket 为 `/private/tmp/mtunl-helper-<uid>/helper.sock`，父目录 root 所有且用户不可写，socket 为调用者所有、0600；双方以 `getpeereid` 检查 UID，客户端必须看到 root 对端。
-- **信任边界是同 UID，不是 app 身份**。同一用户的其他程序也能控制已授权会话。管理员授权信任当时的 helper 可执行文件和所选内核代码，不提供发布签名认证。内核首次授权时核对 SHA256，并复制到 root-only 会话目录；之后 IPC 不能指定 executable、任意文件路径、argv、shell 或 YAML。CIDR、端口及 auto-route 由类型化请求传递，helper 校验后生成固定 YAML。
-- helper 和用户 daemon 均持有 `flock` singleton 锁，拒绝不安全的目录、锁和 socket。状态轮询不会启动、接管或重启其他现存进程。旧版本 daemon 不会被自动替换：请自行停止后再运行新版。
+- **信任边界是同 UID，不是 app 身份**。同一用户的其他程序也能控制已授权会话。管理员授权信任当时的 helper 可执行文件和所选内核代码，不提供发布签名认证。内核首次授权时核对 SHA256，并复制到 root-only 会话目录；IPC 只传递类型化规则、端口和路由选项，helper 校验后生成 YAML，不接收可执行路径、argv 或 shell 命令。
+- helper 和用户 daemon 均持有 `flock` singleton 锁，拒绝不安全的目录、锁和 socket。状态轮询不会启动、接管或重启其他现存进程。协议不兼容时，客户端会停止旧 daemon 并启动新版。
 - helper 持有通往独立特权 watchdog 的管道租约；watchdog 是 Mihomo 的直接父进程。停止时关闭租约，watchdog 发送 TERM，2 秒后仍未退出则发送 KILL 并 waitpid 回收；helper 最多等待 4 秒，超时保留 ownership 并报告失败。信号只发给未回收的直属子进程，避免 PID 复用误杀。重复 start 返回现有实例，配置更改不会自动重启运行中的内核。
 - `mtunlctl mihomo-helper-reset`（或面板重置按钮）仅在内核停止时退出 helper；下一次启动重新授权快照。下载新版本本身不撤销授权、不替换运行内核。
 - helper 用 kqueue 监控原 daemon 的退出（包括 crash / SIGKILL），并在正常退出、TERM、INT、HUP 时清理内核、socket 和会话目录。**SIGKILL 无法捕获**：helper 自身被强杀或崩溃后，操作系统关闭管道，独立 watchdog 检测 EOF 后仍会执行 TERM → KILL 清理。watchdog 不持有 helper socket 或 singleton 锁，也不接受 IPC 命令；它与 helper 一并被 SIGKILL 时无法保证清理。强杀后的旧 root-only 会话目录可能残留，暂无自动回收；旧 socket 在下次授权启动时安全替换。锁文件有意保留以避免 inode 竞争。

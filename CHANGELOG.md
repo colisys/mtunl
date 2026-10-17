@@ -22,6 +22,7 @@
 - 从配置模型移除运行时密码字段，status 和命令预览不含凭据。
 
 ### Added
+- Mihomo TUN 支持通用逐行匹配规则，自动绑定 SSH 出口；旧 CIDR 配置自动迁移。
 - 新增 PTY 主机指纹确认、指纹变化失败和请求生命周期测试；精简认证说明见 [FEATURES.md](FEATURES.md)。
 
 ### Other

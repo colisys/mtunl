@@ -4,7 +4,7 @@ import Darwin
 
 final class HelperTests: XCTestCase {
     private var config: HelperConfiguration {
-        HelperConfiguration(cidrs: ["10.0.0.0/8"], mixedPort: 17890, controllerPort: 19090, socksPort: 1080, autoRoute: true)
+        HelperConfiguration(rules: ["IP-CIDR,10.0.0.0/8"], mixedPort: 17890, controllerPort: 19090, socksPort: 1080, autoRoute: true)
     }
     private func fixture(_ script: String) throws -> (URL, URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -16,8 +16,9 @@ final class HelperTests: XCTestCase {
     }
     func testTypedProtocolRejectsCommandsAndInjection() throws {
         XCTAssertThrowsError(try JSONDecoder().decode(HelperRequest.self, from: Data(#"{"operation":"exec","path":"/bin/sh"}"#.utf8)))
-        for cidr in ["10.0.0.0/8\nexternal-controller: 0.0.0.0:80", "1.2.3.4/32,OTHER", "::/129"] {
-            var invalid = config; invalid.cidrs = [cidr]
+        for rule in ["IP-CIDR,10.0.0.0/8\nexternal-controller: 0.0.0.0:80",
+                     "DOMAIN-SUFFIX,", "DOMAIN,example.com,DIRECT", "MATCH,DIRECT"] {
+            var invalid = config; invalid.rules = [rule]
             XCTAssertThrowsError(try invalid.yaml())
         }
         var invalid = config; invalid.socksPort = 22
@@ -143,7 +144,7 @@ final class HelperTests: XCTestCase {
         let supervisor = MihomoSupervisor(kernelManager: MihomoKernelManager(root: directory), authorizeTUN: true,
                                            homeDirectory: directory, client: transport)
         let tunnel = TunnelConfig(name: "test", kind: .dynamic, host: "localhost", user: "test", listenPort: 1080)
-        supervisor.apply(settings: MihomoSettings(binaryPath: binary.path, dynamicTunnelID: tunnel.id, cidrs: ["10.0.0.0/8"]), tunnels: [tunnel])
+        supervisor.apply(settings: MihomoSettings(binaryPath: binary.path, dynamicTunnelID: tunnel.id, rules: ["IP-CIDR,10.0.0.0/8"]), tunnels: [tunnel])
         supervisor.start()
         XCTAssertEqual(transport.entered.wait(timeout: .now() + 2), .success)
         let start = Date()

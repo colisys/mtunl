@@ -1,8 +1,8 @@
 import Foundation
 
 public enum ControlProtocol {
-    // Host-key trust requests require a new daemon command and status field.
-    public static let version = 3
+    // Host-key trust and Mihomo rule settings require the updated daemon/helper pair.
+    public static let version = 4
 }
 
 public enum TunnelState: String, Codable, Sendable {
