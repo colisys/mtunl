@@ -25,10 +25,12 @@ public struct TunnelStatus: Codable, Equatable, Identifiable, Sendable {
     /// Seconds until the next retry while `waiting`.
     public var retryIn: Int?
     public var log: [String]
+    /// Non-secret challenge issued only after actual final-target password fallback evidence.
+    public var passwordRequestID: UUID?
 
     public init(
         id: UUID, name: String, state: TunnelState, pid: Int32? = nil, message: String? = nil,
-        restarts: Int = 0, retryIn: Int? = nil, log: [String] = []
+        restarts: Int = 0, retryIn: Int? = nil, log: [String] = [], passwordRequestID: UUID? = nil
     ) {
         self.id = id
         self.name = name
@@ -38,6 +40,7 @@ public struct TunnelStatus: Codable, Equatable, Identifiable, Sendable {
         self.restarts = restarts
         self.retryIn = retryIn
         self.log = log
+        self.passwordRequestID = passwordRequestID
     }
 }
 
@@ -46,13 +49,16 @@ public struct ControlRequest: Codable, Sendable {
     public var command: String
     /// A tunnel UUID or a unique name.
     public var target: String?
-    /// Optional one-time password for this start command (not saved).
+    /// Session-only credential, retained in daemon memory until stop/removal/auth failure.
+    /// Password starts use a new command so old daemons cannot fall back to argv transport.
     public var oneTimePassword: String?
+    public var passwordRequestID: UUID?
 
-    public init(command: String, target: String? = nil, oneTimePassword: String? = nil) {
-        self.command = command
+    public init(command: String, target: String? = nil, oneTimePassword: String? = nil, passwordRequestID: UUID? = nil) {
+        self.command = command == "start" && oneTimePassword != nil ? "startSession" : command
         self.target = target
         self.oneTimePassword = oneTimePassword
+        self.passwordRequestID = passwordRequestID
     }
 }
 

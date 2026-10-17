@@ -24,13 +24,17 @@ public final class TunnelSupervisor: @unchecked Sendable {
         var retryTimer: DispatchSourceTimer?
         var runningTimer: DispatchSourceTimer?
         var oneTimePassword: String? // temporary password for this session only
+        var passwordRequestID: UUID?
+        var usesBridge = false
+        var eventBuffer = Data()
         init(config: TunnelConfig) { self.config = config }
     }
 
     let queue = DispatchQueue(label: "mtunl.supervisor")
     var entries: [UUID: Entry] = [:]
     var order: [UUID] = []
-    let resolver: CommandResolver
+    let resolver: CommandResolver?
+    let bridgePath: String
     let backoff: Backoff
     let portInUse: @Sendable (String, Int) -> Bool
     let stableAfter: TimeInterval
@@ -39,15 +43,14 @@ public final class TunnelSupervisor: @unchecked Sendable {
         backoff: Backoff = Backoff(),
         stableAfter: TimeInterval = 2,
         portInUse: @escaping @Sendable (String, Int) -> Bool = { PortProbe.isInUse(address: $0, port: $1) },
-        resolver: @escaping CommandResolver = { config in
-            try config.validate()
-            return try CommandBuilder.command(for: config)
-        }
+        bridgePath: String = Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("mtunl-ssh-bridge").path,
+        resolver: CommandResolver? = nil
     ) {
         self.backoff = backoff
         self.stableAfter = stableAfter
         self.portInUse = portInUse
         self.resolver = resolver
+        self.bridgePath = bridgePath
     }
 
     // MARK: Public API
@@ -59,12 +62,16 @@ public final class TunnelSupervisor: @unchecked Sendable {
             let newIDs = Set(configs.map(\.id))
             for (id, entry) in entries where !newIDs.contains(id) {
                 entry.pendingRemoval = true
-                if entry.process == nil { entries[id] = nil } else { stopLocked(entry) }
+                stopLocked(entry)
+                if entry.process == nil { entries[id] = nil }
             }
             for config in configs {
                 if let entry = entries[config.id] {
                     entry.pendingRemoval = false
                     guard entry.config != config else { continue }
+                    // Never carry a credential across destination/config changes.
+                    entry.oneTimePassword = nil
+                    entry.passwordRequestID = nil
                     entry.config = config
                     if entry.desired { restartLocked(entry) }
                 } else {
@@ -82,12 +89,24 @@ public final class TunnelSupervisor: @unchecked Sendable {
     public func start(_ id: UUID) { queue.sync { entries[id].map(startLocked) } }
     public func start(_ id: UUID, oneTimePassword: String?) {
         queue.sync {
-            if let entry = entries[id] {
-                entry.oneTimePassword = oneTimePassword
+            if let entry = entries[id], !entry.desired {
+                entry.oneTimePassword = entry.config.kind.usesSSH ? oneTimePassword : nil
                 startLocked(entry)
             }
         }
     }
+    /// Reject stale UI responses after stop, deletion, configuration edits or another start.
+    public func supplyPassword(_ id: UUID, requestID: UUID?, password: String?) -> Bool {
+        queue.sync {
+            guard let entry = entries[id], let requestID,
+                  entry.passwordRequestID == requestID,
+                  let password, !password.isEmpty else { return false }
+            entry.oneTimePassword = password
+            startLocked(entry)
+            return true
+        }
+    }
+
     public func stop(_ id: UUID) { queue.sync { entries[id].map(stopLocked) } }
     public func restart(_ id: UUID) { queue.sync { entries[id].map(restartLocked) } }
     public func startAll() { queue.sync { orderedEntries.forEach(startLocked) } }
@@ -101,7 +120,7 @@ public final class TunnelSupervisor: @unchecked Sendable {
                     id: entry.config.id, name: entry.config.name, state: entry.state,
                     pid: entry.process.map { $0.processIdentifier }, message: entry.message,
                     restarts: entry.restarts, retryIn: entry.state == .waiting ? retryIn : nil,
-                    log: entry.log
+                    log: entry.log, passwordRequestID: entry.passwordRequestID
                 )
             }
         }

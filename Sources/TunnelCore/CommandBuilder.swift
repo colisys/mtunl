@@ -26,8 +26,12 @@ public struct ToolCommand: Equatable, Sendable {
 
 public enum CommandBuilderError: LocalizedError, Equatable {
     case toolNotFound(String)
+
+    case invalidSessionPassword
     public var errorDescription: String? {
         switch self {
+        case .invalidSessionPassword: return "会话密码必须为 1–1023 字节 UTF-8，且不含控制字符"
+
         case .toolNotFound(let name): return "找不到 \(name)，请先安装（如 brew install \(name)）"
         }
     }
@@ -53,8 +57,8 @@ public enum CommandBuilder {
     }
 
     /// Builds the command for a config. Call `validate()` first.
-    /// Reads `config.sshLoginPassword` for password authentication (requires sshpass).
-    public static func command(for config: TunnelConfig, socatPath: String? = nil) throws -> ToolCommand {
+    /// Passwords are never part of a command. The supervisor supplies only a capability flag.
+    public static func command(for config: TunnelConfig, socatPath: String? = nil, passwordFallback: Bool = false) throws -> ToolCommand {
         if config.kind == .relay {
             guard let socat = socatPath ?? locate("socat") else { throw CommandBuilderError.toolNotFound("socat") }
             let listen = "TCP-LISTEN:\(config.listenPort),bind=\(config.bindAddress),reuseaddr,fork"
@@ -71,15 +75,18 @@ public enum CommandBuilder {
             "-o", "ConnectTimeout=10",
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
-            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "StrictHostKeyChecking=yes",
         ]
-        // BatchMode is incompatible with password auth and first-time host key acceptance
-        if config.sshLoginPassword == nil {
+        args += ["-o", "PreferredAuthentications=publickey,password", "-o", "KbdInteractiveAuthentication=no"]
+        if passwordFallback {
+            args += ["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1",
+                     "-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=yes"]
+        } else {
             args += ["-o", "BatchMode=yes"]
         }
         if let port = config.sshPort { args += ["-p", String(port)] }
         if let identity = config.identityFile, !identity.isEmpty {
-            args += ["-i", identity, "-o", "IdentitiesOnly=yes"]
+            args += ["-i", identity]
         }
         if let jump = config.jumpHost, !jump.isEmpty { args += ["-J", jump] }
 
@@ -97,13 +104,7 @@ public enum CommandBuilder {
         // `--` stops option parsing so a destination can never be read as a flag.
         args += ["--", config.destination]
         
-        // Wrap with sshpass if password is provided
-        if let password = config.sshLoginPassword {
-            guard let sshpass = locate("sshpass") else {
-                throw CommandBuilderError.toolNotFound("sshpass")
-            }
-            return ToolCommand(executable: sshpass, arguments: ["-p", password, sshPath] + args)
-        }
+
         return ToolCommand(executable: sshPath, arguments: args)
     }
 }

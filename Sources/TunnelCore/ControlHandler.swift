@@ -98,7 +98,7 @@ public final class ControlHandler: @unchecked Sendable {
         case "stopAll":
             supervisor.stopAll()
             return ControlResponse(success: true, statuses: supervisor.statuses(), mihomo: mihomo.currentStatus())
-        case "start", "stop", "restart":
+        case "start", "startSession", "stop", "restart":
             return perform(request)
         case "shutdown":
             mihomo.stop()
@@ -127,7 +127,11 @@ public final class ControlHandler: @unchecked Sendable {
             match = found
         }
         switch request.command {
-        case "start": supervisor.start(match.id, oneTimePassword: request.oneTimePassword)
+        case "startSession":
+            guard supervisor.supplyPassword(match.id, requestID: request.passwordRequestID, password: request.oneTimePassword) else {
+                return ControlResponse(success: false, error: "密码请求已过期或目标尚未明确请求密码，请重新启动认证")
+            }
+        case "start": supervisor.start(match.id)
         case "stop": supervisor.stop(match.id)
         default: supervisor.restart(match.id)
         }

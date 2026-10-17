@@ -7,6 +7,7 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
+        .executable(name: "mtunl-ssh-bridge", targets: ["mtunl-ssh-bridge"]),
         .executable(name: "MTunl", targets: ["MTunl"]),
         .executable(name: "mtunlctl", targets: ["mtunlctl"]),
                 .executable(name: "mtunl-helper", targets: ["mtunl-helper"]),
@@ -14,6 +15,7 @@ let package = Package(
         .library(name: "TunnelCore", targets: ["TunnelCore"]),
     ],
     targets: [
+        .executableTarget(name: "mtunl-ssh-bridge"),
         .target(name: "MihomoWatchdog"),
                 .target(name: "TunnelCore", dependencies: ["MihomoWatchdog"]),
                 .executableTarget(name: "mtunl-helper", dependencies: ["TunnelCore"]),

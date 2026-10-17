@@ -68,12 +68,7 @@ struct TunnelMenuView: View {
                                 status: model.status(for: config),
                                 active: model.isActive(config),
                                 toggle: {
-                                    if !model.isActive(config) && config.sshAuthMethod == .password {
-                                        // Starting with password auth: prompt with NSAlert
-                                        promptForPassword(config: config)
-                                    } else {
-                                        model.toggle(config)
-                                    }
+                                    model.toggle(config)
                                 },
                                 edit: { editing = config },
                                 copy: { model.copyCommand(config) },
@@ -106,32 +101,7 @@ struct TunnelMenuView: View {
         }
     }
     
-    private func promptForPassword(config: TunnelConfig) {
-        let alert = NSAlert()
-        alert.messageText = "输入 SSH 密码"
-        alert.informativeText = "启动隧道：\(config.name)"
-        alert.alertStyle = .informational
-        
-        let passwordField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        passwordField.placeholderString = "密码"
-        alert.accessoryView = passwordField
-        
-        alert.addButton(withTitle: "启动")
-        alert.addButton(withTitle: "取消")
-        
-        // Make the alert window always on top and activate it
-        DispatchQueue.main.async {
-            NSApp.activate(ignoringOtherApps: true)
-            let response = alert.runModal()
-            
-            if response == .alertFirstButtonReturn {
-                let password = passwordField.stringValue
-                if !password.isEmpty {
-                    model.toggle(config, oneTimePassword: password)
-                }
-            }
-        }
-    }
+
 }
 
 private struct TunnelRow: View {

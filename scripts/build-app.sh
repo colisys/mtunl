@@ -26,9 +26,10 @@ fi
 swift build -j 1 -c release --product MTunl
 swift build -j 1 -c release --product mtunlctl
 swift build -j 1 -c release --product mtunl-helper
+swift build -j 1 -c release --product mtunl-ssh-bridge
 
 BIN=$(swift build -c release --show-bin-path)
-for NAME in MTunl mtunlctl mtunl-helper; do
+for NAME in MTunl mtunlctl mtunl-helper mtunl-ssh-bridge; do
     if [ ! -x "$BIN/$NAME" ]; then
         printf '错误：未找到可执行文件 %s\n' "$BIN/$NAME" >&2
         exit 1
@@ -44,7 +45,9 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$BIN/MTunl" "$APP/Contents/MacOS/MTunl"
 cp "$BIN/mtunlctl" "$APP/Contents/MacOS/mtunlctl"
 cp "$BIN/mtunl-helper" "$APP/Contents/MacOS/mtunl-helper"
+cp "$BIN/mtunl-ssh-bridge" "$APP/Contents/MacOS/mtunl-ssh-bridge"
 
+chmod 755 "$APP/Contents/MacOS/mtunl-ssh-bridge"
 chmod 755 "$APP/Contents/MacOS/MTunl" "$APP/Contents/MacOS/mtunlctl" "$APP/Contents/MacOS/mtunl-helper"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,6 +70,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 plutil -lint "$APP/Contents/Info.plist"
 if [ "$SIGN" -eq 1 ]; then
+    codesign --force --sign - "$APP/Contents/MacOS/mtunl-ssh-bridge"
     codesign --force --sign - "$APP/Contents/MacOS/mtunlctl"
         codesign --force --sign - "$APP/Contents/MacOS/mtunl-helper"
     

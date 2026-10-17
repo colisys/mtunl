@@ -77,7 +77,7 @@ struct TunnelEditor: View {
                 
                 Picker("认证方式", selection: $config.sshAuthMethod) {
                     ForEach(SSHAuthMethod.allCases, id: \.self) { method in
-                        Text(method.rawValue).tag(method)
+                        Text(method == .password ? "密钥优先 + 密码回退" : "Agent / 密钥").tag(method)
                     }
                 }
                 .controlSize(.small)
@@ -91,7 +91,7 @@ struct TunnelEditor: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("启动时输入 SSH 密码")
+                    Text("保留 SSH config / 跳板配置。密钥优先；密钥未成功或服务端不提供 publickey 时，仅最终目标明确支持 password 才请求密码；跳板须使用 agent/密钥，歧义提示拒绝。首次连接请独立核验主机指纹。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

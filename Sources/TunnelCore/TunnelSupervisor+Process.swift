@@ -5,6 +5,7 @@ extension TunnelSupervisor {
     // MARK: Transitions (queue-confined)
 
     func startLocked(_ entry: Entry) {
+        entry.passwordRequestID = nil
         entry.desired = true
         if entry.process != nil {
             if entry.stopping { entry.relaunchNow = true }
@@ -17,6 +18,8 @@ extension TunnelSupervisor {
 
     func stopLocked(_ entry: Entry) {
         entry.desired = false
+        entry.oneTimePassword = nil
+        entry.passwordRequestID = nil
         entry.relaunchNow = false
         entry.retryTimer?.cancel()
         entry.retryTimer = nil
@@ -69,18 +72,31 @@ extension TunnelSupervisor {
     func launch(_ entry: Entry) {
         guard entry.desired, entry.process == nil else { return }
         
-        // If a one-time password was provided, temporarily inject it into the config
-        // Keep it until connection is stable (state becomes .running)
-        if let oneTime = entry.oneTimePassword {
-            entry.config.sshLoginPassword = oneTime
-        }
-        
+        let passwordFallback = entry.config.sshAuthMethod == .password || entry.oneTimePassword != nil
+        let useBridge = entry.config.kind.usesSSH && (resolver == nil || entry.oneTimePassword != nil)
+        entry.usesBridge = useBridge
+        entry.eventBuffer.removeAll()
         let command: ToolCommand
         do {
-            command = try resolver(entry.config)
+            if let resolver {
+                command = try resolver(entry.config)
+            } else {
+                try entry.config.validate()
+                command = try CommandBuilder.command(for: entry.config, passwordFallback: passwordFallback)
+            }
+            if useBridge && !FileManager.default.isExecutableFile(atPath: bridgePath) {
+                throw CommandBuilderError.toolNotFound("mtunl-ssh-bridge（请重新构建完整应用）")
+            }
+            if let password = entry.oneTimePassword {
+                let bytes = Array(password.utf8)
+                guard !bytes.isEmpty, bytes.count <= 1023, bytes.allSatisfy({ $0 >= 32 && $0 != 127 }) else {
+                    throw CommandBuilderError.invalidSessionPassword
+                }
+            }
         } catch {
             // Configuration or a missing tool: retrying cannot help.
             entry.desired = false
+            entry.oneTimePassword = nil
             entry.state = .failed
             entry.message = error.localizedDescription
             return
@@ -91,9 +107,21 @@ extension TunnelSupervisor {
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: command.executable)
+        process.executableURL = URL(fileURLWithPath: useBridge ? bridgePath : command.executable)
         process.arguments = command.arguments
-        process.standardInput = FileHandle.nullDevice
+        let secretPipe = useBridge ? Pipe() : nil
+        process.standardInput = secretPipe.map { $0 as Any } ?? FileHandle.nullDevice
+        // Bounded frame fits before spawning: no post-spawn write/SIGPIPE race.
+        if let secretPipe {
+            let password = entry.oneTimePassword ?? ""
+            var frame = Data()
+            var size = UInt32(password.utf8.count).bigEndian
+            withUnsafeBytes(of: &size) { frame.append(contentsOf: $0) }
+            frame.append(contentsOf: password.utf8)
+            secretPipe.fileHandleForWriting.write(frame)
+            secretPipe.fileHandleForWriting.closeFile()
+            frame.resetBytes(in: 0..<frame.count)
+        }
         process.standardOutput = FileHandle.nullDevice
         let pipe = Pipe()
         process.standardError = pipe
@@ -106,7 +134,9 @@ extension TunnelSupervisor {
                 handle.readabilityHandler = nil
                 return
             }
-            self?.queue.async { if let entry { Self.append(data, to: entry) } }
+            self?.queue.async {
+                if let entry, entry.generation == generation { Self.append(data, to: entry) }
+            }
         }
         process.terminationHandler = { [weak self] finished in
             self?.queue.async {
@@ -116,6 +146,7 @@ extension TunnelSupervisor {
         }
         do {
             try process.run()
+            secretPipe?.fileHandleForReading.closeFile()
         } catch {
             pipe.fileHandleForReading.readabilityHandler = nil
             return scheduleRetry(entry, reason: "无法启动：\(error.localizedDescription)")
@@ -127,18 +158,29 @@ extension TunnelSupervisor {
         entry.message = nil
         entry.startedAt = Date()
         entry.log.removeAll()
-        entry.runningTimer = makeTimer(after: stableAfter) { [weak entry] in
-            guard let entry, entry.generation == generation, entry.process != nil, !entry.stopping else { return }
-            entry.state = .running
-            // Connection is stable, clear one-time password
-            if entry.oneTimePassword != nil {
-                entry.oneTimePassword = nil
-                entry.config.sshLoginPassword = nil
+        if !useBridge {
+            // Relay/test commands have no SSH authentication events.
+            entry.runningTimer = makeTimer(after: stableAfter) { [weak entry] in
+                guard let entry, entry.generation == generation, entry.process != nil, !entry.stopping else { return }
+                entry.state = .running
             }
         }
     }
 
-    private static func append(_ data: Data, to entry: Entry) {
+    static func append(_ data: Data, to entry: Entry) {
+        if entry.usesBridge {
+            entry.eventBuffer.append(data)
+            while let newline = entry.eventBuffer.firstIndex(of: 10) {
+                let line = String(decoding: entry.eventBuffer.prefix(upTo: newline), as: UTF8.self)
+                entry.eventBuffer.removeSubrange(...newline)
+                if line == "MTUNL_AUTHENTICATED", entry.process != nil, !entry.stopping, entry.desired {
+                    entry.state = .running
+                }
+                // Never expose unrecognized helper output, even if a child echoes a secret.
+            }
+            if entry.eventBuffer.count > 4096 { entry.eventBuffer.removeAll() }
+            return
+        }
         let text = String(decoding: data, as: UTF8.self)
         for line in text.split(whereSeparator: \.isNewline) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -166,28 +208,33 @@ extension TunnelSupervisor {
             entry.message = nil
             return
         }
+        if entry.usesBridge && status == 79 && !signaled && entry.oneTimePassword == nil {
+            entry.desired = false
+            entry.relaunchNow = false
+            entry.state = .failed
+            entry.passwordRequestID = UUID()
+            entry.message = "无可用密钥/agent，且服务器支持密码认证；等待输入登录密码"
+            return
+        }
+        // Check for authentication failure before honoring a pending restart.
+        let isAuthFailure = status == 77 || status == 78 || status == 79 || entry.log.contains {
+            $0.lowercased().contains("permission denied") || $0.lowercased().contains("authentication failed")
+        }
+        
+        if isAuthFailure && (entry.usesBridge || entry.oneTimePassword != nil) {
+            // Clear password on auth failure and stop retrying
+            entry.oneTimePassword = nil
+            entry.desired = false
+            entry.state = .failed
+            entry.message = status == 78 ? "认证提示不受支持或不确定；拒绝发送密码（请使用 agent/密钥）" : "认证失败，请重新输入密码"
+            return
+        }
+        
         if entry.relaunchNow {
             entry.relaunchNow = false
             entry.attempts = 0
             return launch(entry)
         }
-        
-        // Check for authentication failure
-        let lastLog = entry.log.last?.lowercased() ?? ""
-        let isAuthFailure = lastLog.contains("permission denied") || 
-                           lastLog.contains("authentication failed") ||
-                           lastLog.contains("authentication failed")
-        
-        if isAuthFailure && entry.oneTimePassword != nil {
-            // Clear password on auth failure and stop retrying
-            entry.oneTimePassword = nil
-            entry.config.sshLoginPassword = nil
-            entry.desired = false
-            entry.state = .failed
-            entry.message = "认证失败，请检查密码"
-            return
-        }
-        
         if uptime >= backoff.healthyUptime { entry.attempts = 0 }
         let reason = entry.log.last ?? (signaled ? "进程被信号终止（\(status)）" : "进程退出（代码 \(status)）")
         scheduleRetry(entry, reason: reason)

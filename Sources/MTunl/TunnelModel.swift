@@ -92,6 +92,38 @@ final class TunnelModel: ObservableObject {
         if let mihomo = response.mihomo { mihomoStatus = mihomo }
         let map = Dictionary(uniqueKeysWithValues: list.map { ($0.id, $0) })
         if map != statuses { statuses = map }
+        presentPasswordRequest()
+    }
+
+    private var presentedPasswordRequests: Set<UUID> = []
+    private var passwordAlertOpen = false
+
+    private func presentPasswordRequest() {
+        guard !passwordAlertOpen,
+              let status = statuses.values.first(where: {
+                  guard let token = $0.passwordRequestID else { return false }
+                  return !presentedPasswordRequests.contains(token)
+              }), let token = status.passwordRequestID else { return }
+        presentedPasswordRequests.insert(token)
+        passwordAlertOpen = true
+        defer { passwordAlertOpen = false }
+        let alert = NSAlert()
+        alert.messageText = "目标 SSH 需要登录密码"
+        alert.informativeText = "\(status.name)：密钥认证未成功或服务端明确不提供 publickey，且最终目标明确提供 password 认证。此密码不会用于跳板或私钥口令。仅在当前会话内存缓存至停止或认证失败。"
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: "继续认证")
+        alert.addButton(withTitle: "取消并停止")
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        let password = field.stringValue
+        field.stringValue = ""
+        guard statuses[status.id]?.passwordRequestID == token else { return }
+        if response == .alertFirstButtonReturn && !password.isEmpty {
+            send("startSession", target: status.id.uuidString, oneTimePassword: password, passwordRequestID: token)
+        } else {
+            send("stop", target: status.id.uuidString)
+        }
     }
 
     func status(for config: TunnelConfig) -> TunnelStatus? { statuses[config.id] }
@@ -105,11 +137,11 @@ final class TunnelModel: ObservableObject {
         send(isActive(config) ? "stop" : "start", target: config.id.uuidString, oneTimePassword: oneTimePassword)
     }
 
-    func send(_ command: String, target: String? = nil, oneTimePassword: String? = nil) {
+    func send(_ command: String, target: String? = nil, oneTimePassword: String? = nil, passwordRequestID: UUID? = nil) {
         let client = self.client
         Task {
             let result = await Task.detached {
-                Result { try client.send(ControlRequest(command: command, target: target, oneTimePassword: oneTimePassword)) }
+                Result { try client.send(ControlRequest(command: command, target: target, oneTimePassword: oneTimePassword, passwordRequestID: passwordRequestID)) }
             }.value
             switch result {
             case .success(let response):

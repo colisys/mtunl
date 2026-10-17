@@ -64,19 +64,29 @@ final class CommandBuilderTests: XCTestCase {
         XCTAssertEqual(ToolCommand.quote("it's"), "'it'\\''s'")
     }
 
-    func testPasswordAuthWithSshpass() throws {
-        guard CommandBuilder.locate("sshpass") != nil else {
-            throw XCTSkip("sshpass not installed (brew install hudochenkov/sshpass/sshpass)")
+    func testPasswordFallbackIsSecretFreeAndKeyFirst() throws {
+        let command = try CommandBuilder.command(for: base(.local), passwordFallback: true)
+        XCTAssertEqual(command.executable, "/usr/bin/ssh")
+        XCTAssertNil(command.environment)
+        for forbidden in ["-F", "ProxyCommand=none", "ProxyJump=none", "PermitLocalCommand=no"] {
+            XCTAssertFalse(command.arguments.contains(forbidden))
         }
+        for option in ["PreferredAuthentications=publickey,password", "BatchMode=no",
+                       "KbdInteractiveAuthentication=no", "NumberOfPasswordPrompts=1",
+                       "StrictHostKeyChecking=yes"] {
+            XCTAssertTrue(command.arguments.contains(option), option)
+        }
+        XCTAssertFalse(command.shellString.contains("sshpass"))
+    }
+
+    func testPasswordFallbackPreservesJumpAndAgentWithIdentity() throws {
         var config = base(.local)
-        config.sshLoginPassword = "secret123"
-        let command = try CommandBuilder.command(for: config)
-        XCTAssertTrue(command.executable.hasSuffix("sshpass"))
-        XCTAssertEqual(command.arguments[0], "-p")
-        XCTAssertEqual(command.arguments[1], "secret123")
-        XCTAssertEqual(command.arguments[2], "/usr/bin/ssh")
-        // Should not contain BatchMode when using password
-        XCTAssertFalse(command.arguments.contains("BatchMode=yes"))
+        config.identityFile = "/tmp/key-path-only"
+        let command = try CommandBuilder.command(for: config, passwordFallback: true)
+        XCTAssertFalse(command.arguments.contains("IdentitiesOnly=yes"))
+        config.jumpHost = "bastion"
+        let args = try CommandBuilder.command(for: config, passwordFallback: true).arguments
+        XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "-J")) + 1], "bastion")
     }
 
     func testNoPasswordUsesBatchMode() throws {

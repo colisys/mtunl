@@ -7,7 +7,7 @@ public enum SSHAuthMethod: String, Codable, Sendable, CaseIterable {
 
 /// A saved tunnel definition. Only the *path* of an identity file is stored;
 /// no passwords or key material ever touch this model.
-/// `sshLoginPassword` is runtime-only and never serialized.
+
 public struct TunnelConfig: Identifiable, Equatable, Sendable {
     
     enum CodingKeys: String, CodingKey {
@@ -34,8 +34,7 @@ public struct TunnelConfig: Identifiable, Equatable, Sendable {
     public var autoStart: Bool
     /// SSH authentication method: password or private key
     public var sshAuthMethod: SSHAuthMethod
-    /// Runtime-only SSH login password, never saved. Used for password authentication (requires sshpass).
-    public var sshLoginPassword: String?
+
 
     public static let loopback = "127.0.0.1"
 
@@ -53,8 +52,7 @@ public struct TunnelConfig: Identifiable, Equatable, Sendable {
         targetHost: String = "localhost",
         targetPort: Int = 0,
         autoStart: Bool = false,
-        sshAuthMethod: SSHAuthMethod = .privateKey,
-        sshLoginPassword: String? = nil
+        sshAuthMethod: SSHAuthMethod = .privateKey
     ) {
         self.id = id
         self.name = name
@@ -70,7 +68,7 @@ public struct TunnelConfig: Identifiable, Equatable, Sendable {
         self.targetPort = targetPort
         self.autoStart = autoStart
         self.sshAuthMethod = sshAuthMethod
-        self.sshLoginPassword = sshLoginPassword
+
     }
 
     /// True when the listening side accepts connections from other machines.
@@ -114,7 +112,7 @@ extension TunnelConfig: Codable {
         targetPort = try container.decode(Int.self, forKey: .targetPort)
         autoStart = try container.decode(Bool.self, forKey: .autoStart)
         sshAuthMethod = try container.decodeIfPresent(SSHAuthMethod.self, forKey: .sshAuthMethod) ?? .privateKey
-        sshLoginPassword = nil  // Never decoded
+
     }
     
     public func encode(to encoder: Encoder) throws {
@@ -133,6 +131,6 @@ extension TunnelConfig: Codable {
         try container.encode(targetPort, forKey: .targetPort)
         try container.encode(autoStart, forKey: .autoStart)
         try container.encode(sshAuthMethod, forKey: .sshAuthMethod)
-        // sshLoginPassword is never encoded
+
     }
 }
