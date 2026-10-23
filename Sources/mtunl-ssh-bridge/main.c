@@ -56,8 +56,9 @@ static struct accepted_host_key accepted_host_keys[MAX_ACCEPTED_HOST_KEYS];
 static size_t accepted_host_key_count;
 static char requested_host[512], requested_fingerprint[128];
 static uint32_t secret_length;
-// Last "ssh: " error summary line from the ssh log; the only diagnostic text the
-// supervisor ever receives, so it must stay non-secret and single-line.
+// Last non-debug ssh log line; the only diagnostic text the supervisor ever
+// receives, so it must stay non-secret and single-line. Covers "ssh: connect ..."
+// as well as kex/banner failures that carry no "ssh: " prefix.
 static char last_error[512];
 static int identifier(const char *s) {
     if (!*s) return 0;
@@ -101,9 +102,10 @@ static int has_method(const char *s, const char *method) {
     return 0;
 }
 static void diagnostic(const char *line, struct identity *id, struct auth *a) {
-    if (!strncmp(line, "ssh: ", 5)) {
+    if (strncmp(line, "debug1: ", 8) && strncmp(line, "Warning: ", 9)) {
+        // Non-debug lines are diagnostics or errors ("ssh: connect ...", kex failures);
+        // keep the last one for MTUNL_ERROR, then continue normal event parsing.
         snprintf(last_error, sizeof(last_error), "%s", line);
-        return;
     }
     if (strstr(line, "Host key verification failed.")) { a->hostkey_failed = 1; return; }
     const char *begin = "debug1: Authenticating to ";

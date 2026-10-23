@@ -60,6 +60,11 @@ int main(int argc, char **argv) {
         line("ssh: connect to host 127.0.0.1 port 1: Connection refused");
         return 255;
     }
+    if (!strcmp(mode, "kex")) {
+        line("kex_exchange_identification: Connection closed by remote host");
+        line("Connection closed by 127.0.0.1 port 1");
+        return 255;
+    }
     if (!strcmp(mode, "jump-prompt")) {
         // ProxyJump hop prompt: printed before the final target's identity line.
         snprintf(prompt, sizeof prompt, "%s@%s's password: ", user, host);
@@ -241,6 +246,10 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn(b"MTUNL_TARGET", output)
         self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", output)
         self.assertIn(b"MTUNL_ERROR ssh: connect to host 127.0.0.1 port 1: Connection refused", output)
+        # Failures without the "ssh: " prefix are passed through too; the last line wins.
+        output = self.run_bridge("kex", frame=self.empty_frame(), expected=255)
+        self.assertIn(b"MTUNL_ERROR Connection closed by 127.0.0.1 port 1", output)
+        self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", output)
 
     def test_publickey_only_server_is_auth_failure(self):
         self.run_bridge("publickey-denied", frame=self.empty_frame(), expected=77)
