@@ -240,6 +240,7 @@ class BridgeTests(unittest.TestCase):
         output = self.run_bridge("refused", frame=self.empty_frame(), expected=255)
         self.assertNotIn(b"MTUNL_TARGET", output)
         self.assertNotIn(b"MTUNL_PASSWORD_REQUIRED", output)
+        self.assertIn(b"MTUNL_ERROR ssh: connect to host 127.0.0.1 port 1: Connection refused", output)
 
     def test_publickey_only_server_is_auth_failure(self):
         self.run_bridge("publickey-denied", frame=self.empty_frame(), expected=77)

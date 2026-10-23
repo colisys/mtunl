@@ -81,6 +81,7 @@ extension TunnelSupervisor {
         let useBridge = entry.config.kind.usesSSH && (resolver == nil || entry.oneTimePassword != nil)
         entry.usesBridge = useBridge
         entry.eventBuffer.removeAll()
+        entry.connectionError = nil
         entry.hostKeyEvent = nil
         let command: ToolCommand
         do {
@@ -202,10 +203,16 @@ extension TunnelSupervisor {
                 if line.hasPrefix("MTUNL_TARGET "), let target = SSHTarget(event: line) {
                     entry.sshTarget = target
                 }
+                var connectionError: String?
+                if line.hasPrefix("MTUNL_ERROR ") {
+                    let message = String(line.dropFirst("MTUNL_ERROR ".count)).trimmingCharacters(in: .whitespaces)
+                    if !message.isEmpty, message.utf8.count <= 512 { connectionError = message }
+                }
                 if line.hasPrefix("MTUNL_HOSTKEY "), let key = SSHHostKey(event: line) {
                     entry.hostKeyEvent = key
                 }
                 // Never expose unrecognized helper output, even if a child echoes a secret.
+                if let connectionError { entry.connectionError = connectionError }
             }
             if entry.eventBuffer.count > 4096 { entry.eventBuffer.removeAll() }
             return
@@ -300,7 +307,8 @@ extension TunnelSupervisor {
             return launch(entry)
         }
         if uptime >= backoff.healthyUptime { entry.attempts = 0 }
-        let reason = entry.log.last ?? (signaled ? "进程被信号终止（\(status)）" : "进程退出（代码 \(status)）")
+        let reason = entry.connectionError ?? entry.log.last
+            ?? (signaled ? "进程被信号终止（\(status)）" : "进程退出（代码 \(status)）")
         scheduleRetry(entry, reason: reason)
     }
 

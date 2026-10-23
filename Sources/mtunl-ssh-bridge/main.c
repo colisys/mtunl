@@ -56,6 +56,9 @@ static struct accepted_host_key accepted_host_keys[MAX_ACCEPTED_HOST_KEYS];
 static size_t accepted_host_key_count;
 static char requested_host[512], requested_fingerprint[128];
 static uint32_t secret_length;
+// Last "ssh: " error summary line from the ssh log; the only diagnostic text the
+// supervisor ever receives, so it must stay non-secret and single-line.
+static char last_error[512];
 static int identifier(const char *s) {
     if (!*s) return 0;
     for (; *s; s++) {
@@ -98,6 +101,10 @@ static int has_method(const char *s, const char *method) {
     return 0;
 }
 static void diagnostic(const char *line, struct identity *id, struct auth *a) {
+    if (!strncmp(line, "ssh: ", 5)) {
+        snprintf(last_error, sizeof(last_error), "%s", line);
+        return;
+    }
     if (strstr(line, "Host key verification failed.")) { a->hostkey_failed = 1; return; }
     const char *begin = "debug1: Authenticating to ";
     if (!strncmp(line, begin, strlen(begin))) {
@@ -341,6 +348,7 @@ done:
     else if (result == HOSTKEY_FAILED) fputs("SSH host key verification failed\n", stderr);
     else if (result == AUTH_FAILURE) fputs("SSH authentication failed\n", stderr);
     else if (result == UNSUPPORTED) fputs("SSH target identity or authentication prompt is ambiguous/unsupported; encrypted keys may need ssh-add\n", stderr);
+    else if (result && last_error[0]) fprintf(stderr, "MTUNL_ERROR %s\n", last_error);
     else if (result) fputs("SSH connection ended\n", stderr);
     return stopping ? 0 : result;
 }

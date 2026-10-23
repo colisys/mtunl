@@ -67,6 +67,7 @@ public final class TunnelSupervisor: @unchecked Sendable {
         var acceptedHostKeys: [SSHHostKey] = []
         var usesBridge = false
         var eventBuffer = Data()
+        var connectionError: String? // last MTUNL_ERROR from the bridge; shown on abnormal exit
         let pendingEventReads = DispatchGroup()
         init(config: TunnelConfig) { self.config = config }
     }
