@@ -44,6 +44,11 @@ public enum CommandBuilderError: LocalizedError, Equatable {
 public enum CommandBuilder {
     public static let sshPath = "/usr/bin/ssh"
 
+    /// Per-tunnel ControlMaster socket path; the daemon creates the directory at startup.
+    public static func sshControlPath(for config: TunnelConfig) -> String {
+        "/tmp/mtunl-\(getuid())/ssh-\(config.id.uuidString).sock"
+    }
+
     /// Looks for `socat` in the usual Homebrew/MacPorts locations, then PATH.
     public static func locate(_ tool: String, environmentPath: String? = ProcessInfo.processInfo.environment["PATH"]) -> String? {
         var directories = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
@@ -69,8 +74,9 @@ public enum CommandBuilder {
             return ToolCommand(executable: socat, arguments: [listen, "TCP:\(config.targetHost):\(config.targetPort)"])
         }
 
-        // No ControlMaster/ControlPath: a shared connection would make `-N`
-        // exit immediately while the forward lives in another process.
+        // The tunnel process is the ControlMaster: terminal sessions multiplex over
+        // this socket without re-authenticating. `-N` stays quiet because we are
+        // the master, not a client of another connection.
         var args = try sshBaseArguments(for: config)
         args.insert("-N", at: 0)
         if passwordFallback {
@@ -96,17 +102,20 @@ public enum CommandBuilder {
         return ToolCommand(executable: sshPath, arguments: args)
     }
 
-    /// A plain interactive login shell in a real terminal. No forwards, no `-N`:
-    /// password / MFA prompts and the remote shell are handled by ssh itself,
-    /// so the authentication restrictions used for unattended forwards don't apply.
+    /// A plain interactive login shell in a real terminal, multiplexing over the
+    /// tunnel's existing SSH connection if running. No forwards, no `-N`: password
+    /// and MFA prompts, and the remote shell itself are handled by ssh interactively.
+    /// If the tunnel is not running, ssh falls back to a direct (non-multiplexed)
+    /// connection with normal auth prompts.
     public static func terminalSession(for config: TunnelConfig) throws -> ToolCommand {
         guard config.kind.usesSSH else { throw CommandBuilderError.noTerminalSession }
+        let socketPath = sshControlPath(for: config)
         var args = [
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "ConnectTimeout=10",
             "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
+            "-o", "ControlPath=\(socketPath)",
             "-o", "StrictHostKeyChecking=ask",
         ]
         args += try connectionArguments(for: config)
@@ -114,16 +123,16 @@ public enum CommandBuilder {
     }
 
     /// Connection options shared by forward-only and interactive sessions.
-    /// No ControlMaster/ControlPath: a shared connection would make `-N`
-    /// exit immediately while the forward lives in another process.
+    /// The forward process runs as ControlMaster so terminal sessions can
+    /// multiplex over it; the socket lives in the daemon's private per-user directory.
     private static func sshBaseArguments(for config: TunnelConfig) throws -> [String] {
         var args = [
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "ConnectTimeout=10",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
+            "-o", "ControlMaster=yes",
+            "-o", "ControlPath=\(sshControlPath(for: config))",
             "-o", "StrictHostKeyChecking=ask",
             "-o", "PreferredAuthentications=publickey,password",
             "-o", "KbdInteractiveAuthentication=no",

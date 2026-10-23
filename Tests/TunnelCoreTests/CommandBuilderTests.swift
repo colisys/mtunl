@@ -67,6 +67,21 @@ final class CommandBuilderTests: XCTestCase {
         }
     }
 
+    func testForwardRunsAsControlMasterAndTerminalSessionMultiplexes() throws {
+        let config = base(.local)
+        let forward = try CommandBuilder.command(for: config).arguments
+        XCTAssertTrue(forward.contains("-o"))
+        XCTAssertTrue(forward.contains("ControlMaster=yes"))
+        let pathArgIndex = try XCTUnwrap(forward.firstIndex { $0.hasPrefix("ControlPath=") })
+        let masterPath = forward[pathArgIndex].replacingOccurrences(of: "ControlPath=", with: "")
+        XCTAssertTrue(masterPath.hasPrefix("/tmp/mtunl-"), masterPath)
+        XCTAssertTrue(masterPath.hasSuffix("ssh-\(config.id.uuidString).sock"), masterPath)
+
+        let terminal = try CommandBuilder.terminalSession(for: config).arguments
+        XCTAssertTrue(terminal.contains("ControlMaster=no"))
+        XCTAssertEqual(terminal.first { $0.hasPrefix("ControlPath=") }, "ControlPath=\(masterPath)")
+    }
+
     func testIdentityAndJump() throws {
         var config = base(.local)
         config.identityFile = "~/.ssh/id_ed25519"

@@ -114,6 +114,11 @@ extension TunnelSupervisor {
         if config.kind.listensLocally, portInUse(config.bindAddress, config.listenPort) {
             return scheduleRetry(entry, reason: "本地端口 \(config.bindAddress):\(config.listenPort) 已被占用")
         }
+        if config.kind.usesSSH {
+            // A stale master socket from a killed process would otherwise be reused.
+            // The master owning a live connection is still running, so we never get here.
+            try? FileManager.default.removeItem(atPath: CommandBuilder.sshControlPath(for: config))
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: useBridge ? bridgePath : command.executable)
