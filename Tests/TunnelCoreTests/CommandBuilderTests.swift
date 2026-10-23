@@ -41,6 +41,21 @@ final class CommandBuilderTests: XCTestCase {
         XCTAssertEqual(command.arguments[index + 1], "127.0.0.1:8080:[::1]:5432")
     }
 
+    func testPasswordFallbackReplacesPasswordAuthOption() throws {
+        let command = try CommandBuilder.command(for: base(.dynamic), passwordFallback: true)
+        // Should contain PasswordAuthentication=yes from fallback
+        XCTAssertTrue(command.arguments.contains("PasswordAuthentication=yes"))
+        // Should NOT contain PasswordAuthentication=no anymore
+        XCTAssertFalse(command.arguments.contains("PasswordAuthentication=no"))
+        // Should NOT have an orphaned "-o" before "-p" (the bug)
+        if let pIndex = command.arguments.firstIndex(of: "-p"), pIndex > 0 {
+            XCTAssertNotEqual(command.arguments[pIndex - 1], "-o",
+                              "Found orphaned -o before -p at index \(pIndex - 1)")
+        }
+        // Port argument should still be present and correct
+        XCTAssertEqual(command.arguments[command.arguments.firstIndex(of: "-p")! + 1], "2222")
+    }
+
     func testRelayUsesSocat() throws {
         let command = try CommandBuilder.command(for: base(.relay), socatPath: "/usr/local/bin/socat")
         XCTAssertEqual(command.executable, "/usr/local/bin/socat")

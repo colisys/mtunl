@@ -82,7 +82,11 @@ public enum CommandBuilder {
         if passwordFallback {
             args += ["-o", "NumberOfPasswordPrompts=1",
                      "-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=yes"]
-            args.removeAll { $0 == "PasswordAuthentication=no" }
+            // Remove the earlier "-o PasswordAuthentication=no" pair (both flag and value).
+            if let index = args.firstIndex(of: "PasswordAuthentication=no"), index > 0, args[index - 1] == "-o" {
+                args.remove(at: index)
+                args.remove(at: index - 1)
+            }
         }
 
         let bind = bracketed(config.bindAddress)
