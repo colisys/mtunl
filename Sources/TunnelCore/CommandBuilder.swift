@@ -29,9 +29,11 @@ public enum CommandBuilderError: LocalizedError, Equatable {
 
     case invalidSessionPassword
     case unknownSSHTarget
+    case noTerminalSession
     public var errorDescription: String? {
         switch self {
         case .invalidSessionPassword: return "会话密码必须为 1–1023 字节 UTF-8，且不含控制字符"
+        case .noTerminalSession: return "socat 中继不提供终端会话"
 
         case .toolNotFound(let name): return "找不到 \(name)，请先安装（如 brew install \(name)）"
         case .unknownSSHTarget: return "尚未确认 SSH 认证目标，拒绝发送密码"
@@ -69,29 +71,13 @@ public enum CommandBuilder {
 
         // No ControlMaster/ControlPath: a shared connection would make `-N`
         // exit immediately while the forward lives in another process.
-        var args = [
-            "-N",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ConnectTimeout=10",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
-            "-o", "StrictHostKeyChecking=ask",
-        ]
-        args += ["-o", "PreferredAuthentications=publickey,password", "-o", "KbdInteractiveAuthentication=no"]
-        args += ["-o", "BatchMode=no"]
+        var args = try sshBaseArguments(for: config)
+        args.insert("-N", at: 0)
         if passwordFallback {
             args += ["-o", "NumberOfPasswordPrompts=1",
                      "-o", "PasswordAuthentication=yes", "-o", "PubkeyAuthentication=yes"]
-        } else {
-            args += ["-o", "PasswordAuthentication=no"]
+            args.removeAll { $0 == "PasswordAuthentication=no" }
         }
-        if let port = config.sshPort { args += ["-p", String(port)] }
-        if let identity = config.identityFile, !identity.isEmpty {
-            args += ["-i", identity]
-        }
-        if let jump = config.jumpHost, !jump.isEmpty { args += ["-J", jump] }
 
         let bind = bracketed(config.bindAddress)
         switch config.kind {
@@ -106,8 +92,55 @@ public enum CommandBuilder {
         }
         // `--` stops option parsing so a destination can never be read as a flag.
         args += ["--", config.destination]
-        
 
         return ToolCommand(executable: sshPath, arguments: args)
+    }
+
+    /// A plain interactive login shell in a real terminal. No forwards, no `-N`:
+    /// password / MFA prompts and the remote shell are handled by ssh itself,
+    /// so the authentication restrictions used for unattended forwards don't apply.
+    public static func terminalSession(for config: TunnelConfig) throws -> ToolCommand {
+        guard config.kind.usesSSH else { throw CommandBuilderError.noTerminalSession }
+        var args = [
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=10",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "StrictHostKeyChecking=ask",
+        ]
+        args += try connectionArguments(for: config)
+        return ToolCommand(executable: sshPath, arguments: args + ["--", config.destination])
+    }
+
+    /// Connection options shared by forward-only and interactive sessions.
+    /// No ControlMaster/ControlPath: a shared connection would make `-N`
+    /// exit immediately while the forward lives in another process.
+    private static func sshBaseArguments(for config: TunnelConfig) throws -> [String] {
+        var args = [
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=10",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "StrictHostKeyChecking=ask",
+            "-o", "PreferredAuthentications=publickey,password",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "BatchMode=no",
+            "-o", "PasswordAuthentication=no",
+        ]
+        args += try connectionArguments(for: config)
+        return args
+    }
+
+    private static func connectionArguments(for config: TunnelConfig) throws -> [String] {
+        var args: [String] = []
+        if let port = config.sshPort { args += ["-p", String(port)] }
+        if let identity = config.identityFile, !identity.isEmpty {
+            args += ["-i", identity]
+        }
+        if let jump = config.jumpHost, !jump.isEmpty { args += ["-J", jump] }
+        return args
     }
 }

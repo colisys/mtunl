@@ -72,6 +72,7 @@ struct TunnelMenuView: View {
                                 },
                                 edit: { editing = config },
                                 copy: { model.copyCommand(config) },
+                                openTerminal: { model.openTerminalSession(config) },
                                 delete: { model.delete(config) }
                             )
                         }
@@ -111,6 +112,7 @@ private struct TunnelRow: View {
     let toggle: () -> Void
     let edit: () -> Void
     let copy: () -> Void
+    let openTerminal: () -> Void
     let delete: () -> Void
 
     private var color: Color {
@@ -147,6 +149,7 @@ private struct TunnelRow: View {
                 Menu {
                     Button("编辑", action: edit)
                     Button("复制命令", action: copy)
+                    Button("打开终端会话", action: openTerminal)
                     Divider()
                     Button("删除", role: .destructive, action: delete)
                 } label: {

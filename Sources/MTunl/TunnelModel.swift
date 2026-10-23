@@ -222,6 +222,33 @@ final class TunnelModel: ObservableObject {
         }
     }
 
+    /// Opens an interactive SSH session in Terminal.app using the tunnel's
+    /// connection settings; the running forward is not reused or affected.
+    func openTerminalSession(_ config: TunnelConfig) {
+        do {
+            try config.validate()
+            let command = try CommandBuilder.terminalSession(for: config)
+            let script = "tell application \"Terminal\"\n"
+                + "    activate\n"
+                + "    do script \(Self.escapedAppleScriptString(command.shellString))\n"
+                + "end tell"
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+            try process.run()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private static func escapedAppleScriptString(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
     func saveMihomo(_ settings: MihomoSettings) {
         do {
             try MihomoConfigStore().save(settings)

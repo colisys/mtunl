@@ -49,6 +49,24 @@ final class CommandBuilderTests: XCTestCase {
         ])
     }
 
+    func testTerminalSessionIsInteractiveWithoutForwards() throws {
+        let command = try CommandBuilder.terminalSession(for: base(.local))
+        XCTAssertEqual(command.executable, "/usr/bin/ssh")
+        XCTAssertFalse(command.arguments.contains("-N"))
+        XCTAssertFalse(command.arguments.contains("-L"))
+        XCTAssertFalse(command.arguments.contains("-D"))
+        XCTAssertFalse(command.arguments.contains("PasswordAuthentication=no"))
+        XCTAssertEqual(Array(command.arguments.suffix(2)), ["--", "me@example.com"])
+        let index = try XCTUnwrap(command.arguments.firstIndex(of: "-p"))
+        XCTAssertEqual(command.arguments[index + 1], "2222")
+    }
+
+    func testTerminalSessionRejectsRelay() {
+        XCTAssertThrowsError(try CommandBuilder.terminalSession(for: base(.relay))) { error in
+            XCTAssertEqual(error as? CommandBuilderError, .noTerminalSession)
+        }
+    }
+
     func testIdentityAndJump() throws {
         var config = base(.local)
         config.identityFile = "~/.ssh/id_ed25519"
