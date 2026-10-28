@@ -242,4 +242,39 @@ final class SFTPClientTests: XCTestCase {
         XCTAssertNil(SFTPClient.compressCommand(
             paths: [], archivePath: "/out/a.tar.gz", format: .tarGz, level: .balanced))
     }
+
+    // MARK: - Chunked transfer
+
+    func testChunkRangesCoverTheFileExactly() {
+        // Exact multiples, remainder, and boundaries.
+        XCTAssertTrue(SFTPClient.chunkRanges(size: 0).isEmpty)
+        XCTAssertTrue(SFTPClient.chunkRanges(size: -1).isEmpty)
+
+        let chunk = SFTPClient.chunkSize
+        XCTAssertEqual(
+            SFTPClient.chunkRanges(size: chunk).map { [Int64($0.offset), Int64($0.length)] },
+            [[0, chunk]]
+        )
+        XCTAssertEqual(
+            SFTPClient.chunkRanges(size: chunk + 1).map { [Int64($0.offset), Int64($0.length)] },
+            [[0, chunk], [chunk, 1]]
+        )
+        XCTAssertEqual(
+            SFTPClient.chunkRanges(size: 3 * chunk + 7).map { [Int64($0.offset), Int64($0.length)] },
+            [[0, chunk], [chunk, chunk], [2 * chunk, chunk], [3 * chunk, 7]]
+        )
+
+        // Invariants: contiguous coverage, no gaps or overlaps.
+        let ranges = SFTPClient.chunkRanges(size: 100 * 1024 * 1024 + 123)
+        XCTAssertEqual(ranges.reduce(Int64(0)) { $0 + $1.length }, 100 * 1024 * 1024 + 123)
+        for (first, second) in zip(ranges, ranges.dropFirst()) {
+            XCTAssertEqual(first.offset + first.length, second.offset)
+        }
+    }
+
+    func testPartPathsAreUniqueAndDeterministic() {
+        XCTAssertEqual(SFTPClient.partPath(for: "/a/b.zip", index: 3), "/a/b.zip.mtunl-part-0003")
+        XCTAssertNotEqual(SFTPClient.partPath(for: "/a/b.zip", index: 1),
+                          SFTPClient.partPath(for: "/a/b.zip", index: 2))
+    }
 }

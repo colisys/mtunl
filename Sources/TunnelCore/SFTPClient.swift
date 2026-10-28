@@ -201,6 +201,180 @@ public enum SFTPClient {
             throw SFTPError.commandFailed("上传失败: \(output)")
         }
     }
+
+    // MARK: - Chunked parallel transfer
+
+    /// Files at or below this size take the single-stream path; splitting
+    /// overhead (extra sftp processes, remote concat) is not worth it.
+    public static let chunkedTransferThreshold: Int64 = 32 * 1024 * 1024
+    /// Size of one parallel chunk: 16 MB keeps the part count reasonable
+    /// while giving the scheduler enough pieces to balance across workers.
+    public static let chunkSize: Int64 = 16 * 1024 * 1024
+    /// Parallel sftp workers per transfer.
+    public static let chunkWorkers = 8
+
+    /// Byte ranges covering `size`: every chunk except the last is
+    /// `chunkSize` long. Pure for unit testing.
+    public static func chunkRanges(size: Int64, chunkSize: Int64 = SFTPClient.chunkSize) -> [(offset: Int64, length: Int64)] {
+        guard size > 0 else { return [] }
+        var ranges: [(offset: Int64, length: Int64)] = []
+        var offset: Int64 = 0
+        while offset < size {
+            let length = min(chunkSize, size - offset)
+            ranges.append((offset, length))
+            offset += length
+        }
+        return ranges
+    }
+
+    /// Remote temporary part path for chunk `index` of `remotePath`.
+    static func partPath(for remotePath: String, index: Int) -> String {
+        "\(remotePath).mtunl-part-\(String(format: "%04d", index))"
+    }
+
+    /// Uploads `localPath` to `remotePath` in parallel chunks over independent
+    /// multiplexed channels, then concatenates the parts on the remote shell.
+    /// Any failure removes the leftover parts before rethrowing.
+    public static func uploadChunked(
+        localPath: String, remotePath: String, config: TunnelConfig,
+        size: Int64, workers: Int = SFTPClient.chunkWorkers
+    ) async throws {
+        let ranges = chunkRanges(size: size)
+        let parts = ranges.indices.map { partPath(for: remotePath, index: $0) }
+
+        do {
+            try await runParallel(workers: workers, jobs: ranges.indices) { index in
+                let slice = ranges[index]
+                // dd-style slice extraction: each worker uploads a plain,
+                // self-contained part file.
+                let temp = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("mtunl-chunk-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: temp) }
+                try extractLocalSlice(
+                    source: localPath, destination: temp.path,
+                    offset: slice.offset, length: slice.length
+                )
+                let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
+                let batch = "put \(Self.escapeSFTPArg(temp.path)) \(Self.escapeSFTPArg(parts[index]))\nbye\n"
+                let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batch, config: config)
+                guard status == 0 else {
+                    throw SFTPError.commandFailed("分块上传失败: \(output)")
+                }
+            }
+
+            // Assemble on the remote side and verify the resulting size.
+            let quoted = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
+            let command = "cat \(quoted) > \(Self.escapeShellArg(remotePath)) && rm -f \(quoted)"
+            let (output, status) = try await runSSHCommand(args: sshCommand(for: config) + [command], config: config)
+            guard status == 0 else {
+                throw SFTPError.commandFailed("远端拼接失败: \(output)")
+            }
+        } catch {
+            // Best effort cleanup; the original error matters more.
+            let quoted = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
+            _ = try? await runSSHCommand(args: sshCommand(for: config) + ["rm -f \(quoted)"], config: config)
+            throw error
+        }
+    }
+
+    /// Downloads `remotePath` in parallel chunks: each worker extracts its
+    /// byte range into a remote temp part with dd, pulls it back, and the
+    /// local slices are concatenated into `localPath`.
+    public static func downloadChunked(
+        remotePath: String, localPath: String, config: TunnelConfig,
+        size: Int64, workers: Int = SFTPClient.chunkWorkers
+    ) async throws {
+        let ranges = chunkRanges(size: size)
+        let parts = ranges.indices.map { partPath(for: remotePath, index: $0) }
+        let localParts = ranges.indices.map { index in
+            URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("mtunl-chunk-\(UUID().uuidString)").path
+        }
+
+        do {
+            try await runParallel(workers: workers, jobs: ranges.indices) { index in
+                let slice = ranges[index]
+                // GNU dd has iflag=skip_bytes,count_bytes; busybox/BSD dd do
+                // not, so fall back to a pure-shell tail+head pipe there.
+                let gnu = "dd if=\(Self.escapeShellArg(remotePath)) of=\(Self.escapeShellArg(parts[index])) bs=1M iflag=skip_bytes,count_bytes skip=\(slice.offset) count=\(slice.length) 2>/dev/null"
+                let portable = "tail -c +\(slice.offset + 1) \(Self.escapeShellArg(remotePath)) | head -c \(slice.length) > \(Self.escapeShellArg(parts[index]))"
+                let command = "\(gnu) 2>/dev/null || \(portable)"
+                let (output, status) = try await runSSHCommand(args: sshCommand(for: config) + [command], config: config)
+                guard status == 0 else {
+                    throw SFTPError.commandFailed("远端分块失败: \(output)")
+                }
+
+                let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
+                let batch = "get \(Self.escapeSFTPArg(parts[index])) \(Self.escapeSFTPArg(localParts[index]))\nbye\n"
+                let (sftpOutput, sftpStatus) = try await runSFTPBatch(args: sftpArgs, batchCommands: batch, config: config)
+                guard sftpStatus == 0 else {
+                    throw SFTPError.commandFailed("分块下载失败: \(sftpOutput)")
+                }
+            }
+
+            // Concatenate the local parts into the destination.
+            FileManager.default.createFile(atPath: localPath, contents: nil)
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: localPath))
+            defer { try? handle.close() }
+            for path in localParts {
+                defer { try? FileManager.default.removeItem(atPath: path) }
+                let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped)
+                try handle.write(contentsOf: data)
+            }
+        } catch {
+            let quoted = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
+            _ = try? await runSSHCommand(args: sshCommand(for: config) + ["rm -f \(quoted)"], config: config)
+            for path in localParts { try? FileManager.default.removeItem(atPath: path) }
+            throw error
+        }
+    }
+
+    /// Copies `length` bytes at `offset` from `source` into `destination`.
+    private static func extractLocalSlice(source: String, destination: String,
+                                          offset: Int64, length: Int64) throws {
+        FileManager.default.createFile(atPath: destination, contents: nil)
+        let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: source))
+        defer { try? input.close() }
+        try input.seek(toOffset: UInt64(offset))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: destination))
+        defer { try? output.close() }
+
+        var remaining = length
+        let bufferSize = 1 * 1024 * 1024
+        while remaining > 0 {
+            let want = Int(min(Int64(bufferSize), remaining))
+            guard let data = try input.read(upToCount: want), !data.isEmpty else { break }
+            try output.write(contentsOf: data)
+            remaining -= Int64(data.count)
+        }
+        guard remaining == 0 else {
+            throw SFTPError.commandFailed("本地分块读取提前结束")
+        }
+    }
+
+    /// Runs `job` for every element of `jobs` with at most `workers` in
+    /// flight, waiting for all to finish. The first error cancels the rest
+    /// and is rethrown.
+    private static func runParallel(workers: Int, jobs: Range<Int>,
+                                    job: @escaping (Int) async throws -> Void) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            var iterator = jobs.makeIterator()
+            var running = 0
+            for _ in 0..<workers {
+                guard let index = iterator.next() else { break }
+                running += 1
+                group.addTask { try await job(index) }
+            }
+            while running > 0 {
+                try await group.next()
+                running -= 1
+                if let index = iterator.next() {
+                    running += 1
+                    group.addTask { try await job(index) }
+                }
+            }
+        }
+    }
     
     /// Delete a remote file
     /// Delete a remote file. Without `force`, `rm` reports a missing file as

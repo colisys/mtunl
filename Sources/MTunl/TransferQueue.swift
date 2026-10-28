@@ -30,8 +30,11 @@ final class TransferQueue: ObservableObject {
 
         var task: Task<Void, Never>?
         var process: Process?
+        /// Processes of a chunked transfer; cancel terminates all of them.
+        var chunkProcesses: [Process] = []
 
-        init(direction: Direction, name: String, size: Int64, localPath: String, remotePath: String, config: TunnelConfig) {
+        init(direction: Direction, name: String, size: Int64,
+             localPath: String, remotePath: String, config: TunnelConfig) {
             self.direction = direction
             self.name = name
             self.size = size
@@ -39,6 +42,9 @@ final class TransferQueue: ObservableObject {
             self.remotePath = remotePath
             self.config = config
         }
+
+        /// True when this file is large enough to be worth splitting.
+        var isChunked: Bool { size > SFTPClient.chunkedTransferThreshold }
     }
 
     @Published private(set) var items: [TransferItem] = []
@@ -78,10 +84,11 @@ final class TransferQueue: ObservableObject {
         guard item.state == .queued || item.state == .running else { return }
         item.state = .cancelled
         item.task?.cancel()
-        // Kill the in-flight sftp process if there is one. If the item was
-        // running, run() decrements the slot when the process dies; queued
-        // items never held a slot.
+        // Kill the in-flight sftp process(es). Chunked transfers own several.
         if let process = item.process, process.isRunning {
+            process.terminate()
+        }
+        for process in item.chunkProcesses where process.isRunning {
             process.terminate()
         }
     }
@@ -109,18 +116,32 @@ final class TransferQueue: ObservableObject {
         do {
             switch item.direction {
             case .upload:
-                try await SFTPClient.upload(
-                    localPath: item.localPath, remotePath: item.remotePath,
-                    config: item.config
-                ) { [weak item] process in
-                    item?.process = process
+                if item.isChunked {
+                    try await SFTPClient.uploadChunked(
+                        localPath: item.localPath, remotePath: item.remotePath,
+                        config: item.config, size: item.size
+                    )
+                } else {
+                    try await SFTPClient.upload(
+                        localPath: item.localPath, remotePath: item.remotePath,
+                        config: item.config
+                    ) { [weak item] process in
+                        item?.process = process
+                    }
                 }
             case .download:
-                try await SFTPClient.download(
-                    remotePath: item.remotePath, localPath: item.localPath,
-                    config: item.config
-                ) { [weak item] process in
-                    item?.process = process
+                if item.isChunked {
+                    try await SFTPClient.downloadChunked(
+                        remotePath: item.remotePath, localPath: item.localPath,
+                        config: item.config, size: item.size
+                    )
+                } else {
+                    try await SFTPClient.download(
+                        remotePath: item.remotePath, localPath: item.localPath,
+                        config: item.config
+                    ) { [weak item] process in
+                        item?.process = process
+                    }
                 }
             }
             item.state = .completed
@@ -135,6 +156,7 @@ final class TransferQueue: ObservableObject {
             }
         }
         item.process = nil
+        item.chunkProcesses = []
         runningCount = max(0, runningCount - 1)
         schedule()
     }
