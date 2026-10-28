@@ -334,9 +334,13 @@ final class RemoteBrowserModel: ObservableObject {
     func decompressSelected() async {
         guard selectedFiles.count == 1 else { return }
 
-        guard let file = files.first(where: { selectedFiles.contains($0.path) }),
-              file.name.hasSuffix(".tar.gz") || file.name.hasSuffix(".tgz") else {
-            errorMessage = "请选择一个 .tar.gz 或 .tgz 文件"
+        guard let file = files.first(where: { selectedFiles.contains($0.path) }) else {
+            return
+        }
+        
+        // Check if it's a supported archive format
+        guard SFTPClient.isSupportedArchive(file.name) else {
+            errorMessage = "不支持的压缩格式。支持的格式：.tar.gz, .tgz, .tar.bz2, .tbz2, .tbz, .tar.xz, .txz, .tar, .zip, .rar, .7z, .gz, .bz2, .xz"
             return
         }
 
@@ -348,7 +352,21 @@ final class RemoteBrowserModel: ObservableObject {
             await loadDirectory()
             selectedFiles.removeAll()
         } catch {
-            errorMessage = error.localizedDescription
+            let errorDesc = error.localizedDescription
+            // Provide more helpful error messages for common cases
+            if errorDesc.contains("command not found") {
+                if file.name.hasSuffix(".zip") {
+                    errorMessage = "解压失败：远程服务器缺少 unzip 命令。\n错误：\(errorDesc)"
+                } else if file.name.hasSuffix(".rar") {
+                    errorMessage = "解压失败：远程服务器缺少 unrar 命令（或使用 unar/7z）。\n错误：\(errorDesc)"
+                } else if file.name.hasSuffix(".7z") {
+                    errorMessage = "解压失败：远程服务器缺少 7z 命令（需要安装 p7zip）。\n错误：\(errorDesc)"
+                } else {
+                    errorMessage = "解压失败：\(errorDesc)"
+                }
+            } else {
+                errorMessage = errorDesc
+            }
         }
 
         isLoading = false

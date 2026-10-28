@@ -114,12 +114,37 @@ sequenceDiagram
     
     U->>V: 选中 .tar.gz → 解压
     V->>C: decompress(archive)
+    C->>C: extractCommand(archive, dest) 按扩展名分派
     C->>S: ssh ... "tar -xzf 'archive.tar.gz' -C '/target'"
     S->>R: 执行 tar -xzf
     R-->>S: 提取文件
     S-->>C: 退出状态0
     C-->>V: 成功
 ```
+
+### 解压格式分派
+
+`SFTPClient.extractCommand(for:destinationPath:)` 是一个纯函数，根据压缩包扩展名返回对应的远程 shell 命令（不支持时返回 `nil`）。这样命令构造可以脱离网络做单元测试。
+
+| 扩展名 | 远程命令 | 依赖工具 |
+|---|---|---|
+| `.tar.gz` / `.tgz` | `tar -xzf ARCHIVE -C DEST` | `tar` |
+| `.tar.bz2` / `.tbz2` / `.tbz` | `tar -xjf ARCHIVE -C DEST` | `tar` |
+| `.tar.xz` / `.txz` | `tar -xJf ARCHIVE -C DEST` | `tar` |
+| `.tar` | `tar -xf ARCHIVE -C DEST` | `tar` |
+| `.zip` | `unzip -o ARCHIVE -d DEST` | `unzip` |
+| `.rar` | `unrar x -o+ ARCHIVE DEST/` | `unrar`（或 `unar`/`7z`） |
+| `.7z` | `7z x -oDEST -y ARCHIVE` | `7z`（p7zip） |
+| `.gz` | `gunzip -c ARCHIVE > DEST/BASE` | `gunzip` |
+| `.bz2` | `bunzip2 -c ARCHIVE > DEST/BASE` | `bunzip2` |
+| `.xz` | `unxz -c ARCHIVE > DEST/BASE` | `unxz` |
+
+实现要点：
+
+- **后缀优先级**：复合后缀（`.tar.gz`）必须先于单文件后缀（`.gz`）判断，否则 `.tar.gz` 会被误当作单文件 gzip。
+- **单文件格式**：`BASE` 为去掉压缩后缀的文件名，通过 `appendingPathComponent` 拼接目标路径，再整体过 `escapeShellArg`，避免引号与斜杠混用出问题。
+- **命令缺失**：远程缺少 `unzip`/`unrar`/`7z` 时，ssh 返回非 0，UI 会把远端 stderr 透传给用户，并指出缺少哪个工具。
+- **参数转义**：所有远程命令参数统一使用 `escapeShellArg`（单引号），与 SFTP batch 的 `escapeSFTPArg`（双引号）严格区分。
 
 ## 连接复用
 

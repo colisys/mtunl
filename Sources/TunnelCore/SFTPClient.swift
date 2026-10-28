@@ -305,7 +305,75 @@ public enum SFTPClient {
         }
     }
     
-    /// Decompress remote archive using tar
+    /// Check if a file extension is a supported archive format
+    public static func isSupportedArchive(_ path: String) -> Bool {
+        extractCommand(for: path, destinationPath: "/tmp") != nil
+    }
+
+    /// Build the remote shell command that extracts `archivePath` into
+    /// `destinationPath`, or `nil` when the extension is not supported.
+    ///
+    /// Exposed for unit testing: the command construction must stay pure and
+    /// must not touch the network.
+    public static func extractCommand(for archivePath: String, destinationPath: String) -> String? {
+        let lower = archivePath.lowercased()
+        let archive = escapeShellArg(archivePath)
+        let dest = escapeShellArg(destinationPath)
+
+        // Compound tar formats must be tested before the plain `.gz`/`.bz2`/`.xz`
+        // single-file branches, otherwise `.tar.gz` would match `.gz`.
+        if lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tgz") {
+            return "tar -xzf \(archive) -C \(dest)"
+        }
+        if lower.hasSuffix(".tar.bz2") || lower.hasSuffix(".tbz2") || lower.hasSuffix(".tbz") {
+            return "tar -xjf \(archive) -C \(dest)"
+        }
+        if lower.hasSuffix(".tar.xz") || lower.hasSuffix(".txz") {
+            return "tar -xJf \(archive) -C \(dest)"
+        }
+        if lower.hasSuffix(".tar") {
+            return "tar -xf \(archive) -C \(dest)"
+        }
+        if lower.hasSuffix(".zip") {
+            return "unzip -o \(archive) -d \(dest)"
+        }
+        if lower.hasSuffix(".rar") {
+            // unrar wants the destination directory as a separate argument;
+            // the trailing slash forces extraction into that directory.
+            return "unrar x -o+ \(archive) \(dest)/"
+        }
+        if lower.hasSuffix(".7z") {
+            // 7z expects -o<dir> with no space; the shell strips the quotes.
+            return "7z x -o\(dest) -y \(archive)"
+        }
+        if lower.hasSuffix(".gz") {
+            return singleFileCommand(tool: "gunzip", suffix: ".gz",
+                                     archivePath: archivePath, destinationPath: destinationPath)
+        }
+        if lower.hasSuffix(".bz2") {
+            return singleFileCommand(tool: "bunzip2", suffix: ".bz2",
+                                     archivePath: archivePath, destinationPath: destinationPath)
+        }
+        if lower.hasSuffix(".xz") {
+            return singleFileCommand(tool: "unxz", suffix: ".xz",
+                                     archivePath: archivePath, destinationPath: destinationPath)
+        }
+        return nil
+    }
+
+    /// Single-file compressed formats decompress to a sibling file with the
+    /// compression suffix removed.
+    private static func singleFileCommand(tool: String, suffix: String,
+                                          archivePath: String, destinationPath: String) -> String {
+        let base = (archivePath as NSString).lastPathComponent
+        let stripped = base.count > suffix.count && base.hasSuffix(suffix)
+            ? String(base.dropLast(suffix.count))
+            : base
+        let target = (destinationPath as NSString).appendingPathComponent(stripped)
+        return "\(tool) -c \(escapeShellArg(archivePath)) > \(escapeShellArg(target))"
+    }
+
+    /// Decompress remote archive (supports tar.gz, tar.bz2, tar.xz, tar, zip, rar, 7z, gz, bz2, xz)
     public static func decompress(archivePath: String, destinationPath: String, config: TunnelConfig) async throws {
         let socketPath = CommandBuilder.sshControlPath(for: config)
         var args = [
@@ -326,7 +394,11 @@ public enum SFTPClient {
             args += ["-J", jump]
         }
         
-        let command = "tar -xzf \(Self.escapeShellArg(archivePath)) -C \(Self.escapeShellArg(destinationPath))"
+        // Detect archive format by extension and build appropriate command
+        guard let command = extractCommand(for: archivePath, destinationPath: destinationPath) else {
+            throw SFTPError.commandFailed("不支持的压缩格式: \(archivePath)")
+        }
+        
         args += ["--", config.destination, command]
         
         let (output, status) = try await runSSHCommand(args: args, config: config)

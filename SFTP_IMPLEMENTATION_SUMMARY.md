@@ -28,7 +28,9 @@
 - ✅ `rename(from:to:config:)` - 重命名/移动（带跨文件系统回退）
 - ✅ `chmod(remotePath:permissions:config:)` - 修改权限
 - ✅ `compress(files:output:config:)` - 远程压缩（`tar -czf`）
-- ✅ `decompress(archive:destination:config:)` - 远程解压（`tar -xzf`）
+- ✅ `decompress(archive:destination:config:)` - 远程解压（支持 tar.gz/tar.bz2/tar.xz/tar/zip/rar/7z/gz/bz2/xz）
+- ✅ `extractCommand(for:destinationPath:)` - 格式分派纯函数，可单元测试
+- ✅ `isSupportedArchive(_:)` - 检查扩展名是否为支持的压缩格式
 - ✅ `copyRemote(from:to:config:)` - 远程复制（`cp -R`）
 - ✅ `executeBatch(operations:config:)` - 批量执行操作
 
@@ -134,7 +136,8 @@ stat -f '%N|%z|%p|%Su|%Sg|%Sm|%HT' '/path'
 - 复制：`cp -R source dest`（远程）
 - 剪切：`rename source dest`（远程），失败时回退到 `cp + rm`
 - 压缩：`tar -czf archive.tar.gz file1 file2 ...`（远程）
-- 解压：`tar -xzf archive.tar.gz -C /target`（远程）
+- 解压：根据扩展名自动选择工具（tar/unzip/unrar/7z/gunzip/bunzip2/unxz）
+  - 例：`.tar.gz` → `tar -xzf`，`.zip` → `unzip`，`.rar` → `unrar`，`.7z` → `7z`
 
 这比"下载→本地操作→上传"快得多，尤其对于大文件和目录。
 

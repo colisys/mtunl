@@ -13,7 +13,7 @@ macOS 菜单栏 SSH 隧道管理工具。只包装系统 `/usr/bin/ssh`（以及
   - 文件和目录的复制、剪切、粘贴
   - 批量文件操作
   - 文件信息查看（权限、所有者、所属组、大小、修改时间）
-  - 远程文件压缩、解压（使用 tar.gz）
+  - 远程文件压缩、解压（支持 tar.gz/tar.bz2/tar.xz/tar/zip/rar/7z/gz/bz2/xz）
   - 详细使用指南见 [SFTP_GUIDE.md](SFTP_GUIDE.md)
 - 打开终端会话：从隧道正在运行的 SSH 连接直接多路复用出一个交互式终端（无需二次认证）；隧道未运行时降级为普通连接，密码 / MFA / agent 全部由系统 ssh 正常处理。
 - Mihomo TUN 流量接管：选择动态 SSH 隧道作为 SOCKS5 出口，逐行填写 Mihomo 匹配规则（域名、Geo、IP/CIDR、端口、进程及复合规则）；命中流量走 SSH，未匹配流量直连。旧 CIDR 配置自动迁移。内核下载与启动独立，支持缓存、版本显示和可选 HTTPS 镜像。
