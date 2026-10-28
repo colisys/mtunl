@@ -82,16 +82,34 @@ public enum SFTPError: LocalizedError, Equatable {
 /// an existing SSH control socket from a running tunnel.
 public enum SFTPClient {
     
-    /// Build SFTP connection arguments using existing SSH tunnel's control socket
-    public static func sftpCommand(for config: TunnelConfig) throws -> [String] {
-        let socketPath = CommandBuilder.sshControlPath(for: config)
-        var args = [
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=\(socketPath)",
-            "-o", "StrictHostKeyChecking=ask",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-        ]
+    /// Build SFTP connection arguments. When `useControlMaster` is true, multiplexes
+    /// over the tunnel's existing SSH connection for fast interactive operations.
+    /// When false, establishes an independent SSH connection for file transfers,
+    /// avoiding ControlMaster contention and enabling parallel transfers.
+    public static func sftpCommand(for config: TunnelConfig, useControlMaster: Bool = true) throws -> [String] {
+        var args: [String]
+        
+        if useControlMaster {
+            let socketPath = CommandBuilder.sshControlPath(for: config)
+            args = [
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=\(socketPath)",
+                "-o", "StrictHostKeyChecking=ask",
+                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=3",
+            ]
+        } else {
+            // Independent connection for transfers: no ControlMaster, longer keepalive.
+            args = [
+                "-o", "StrictHostKeyChecking=ask",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=6",
+                "-o", "ConnectTimeout=15",
+                "-o", "PreferredAuthentications=publickey,password",
+                "-o", "KbdInteractiveAuthentication=no",
+                "-o", "BatchMode=no",
+            ]
+        }
         
         if let port = config.sshPort {
             args += ["-P", String(port)]
@@ -107,7 +125,8 @@ public enum SFTPClient {
         return args
     }
     
-    /// Build SSH command arguments for running remote commands
+    /// Build SSH command arguments for running remote commands.
+    /// Always uses ControlMaster for fast execution of small operations.
     private static func sshCommand(for config: TunnelConfig) throws -> [String] {
         let socketPath = CommandBuilder.sshControlPath(for: config)
         var args = [
@@ -163,10 +182,11 @@ public enum SFTPClient {
         return try parseStatOutput(output, path: remotePath)
     }
     
-    /// Download a file from remote to local
+    /// Download a file from remote to local using an independent SSH connection
+    /// to avoid ControlMaster contention and allow parallel transfers.
     public static func download(remotePath: String, localPath: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws {
         try Task.checkCancellation()
-        let sftpArgs = try sftpCommand(for: config)
+        let sftpArgs = try sftpCommand(for: config, useControlMaster: false)
         let batchCommands = "get -r \(Self.escapeSFTPArg(remotePath)) \(Self.escapeSFTPArg(localPath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config, onProcessStart: onProcessStart)
@@ -176,10 +196,11 @@ public enum SFTPClient {
         }
     }
     
-    /// Upload a file from local to remote
+    /// Upload a file from local to remote using an independent SSH connection
+    /// to avoid ControlMaster contention and allow parallel transfers.
     public static func upload(localPath: String, remotePath: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws {
         try Task.checkCancellation()
-        let sftpArgs = try sftpCommand(for: config)
+        let sftpArgs = try sftpCommand(for: config, useControlMaster: false)
         let batchCommands = "put -r \(Self.escapeSFTPArg(localPath)) \(Self.escapeSFTPArg(remotePath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config, onProcessStart: onProcessStart)
