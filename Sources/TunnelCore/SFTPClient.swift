@@ -81,12 +81,13 @@ public enum SFTPError: LocalizedError, Equatable {
 /// SFTP client that wraps the system `sftp` command and can multiplex over
 /// an existing SSH control socket from a running tunnel.
 public enum SFTPClient {
-    /// Pipelining flags for file transfers. `-B` raises the buffer from 32 KB
-    /// to 1 MB and `-R` allows 64 outstanding requests; without them a single
-    /// multiplexed channel waits for each reply, collapsing throughput on
-    /// higher-latency links. Only meaningful for `get`/`put`, not for `rm`
-    /// and other short operations.
-    static let transferFlags = ["-B", "1048576", "-R", "64"]
+    /// Pipelining flags for file transfers. `-R` allows 64 outstanding requests
+    /// so a multiplexed channel keeps data in flight instead of waiting for
+    /// each reply. `-B` must stay well under the SSH channel message limit:
+    /// over a ControlMaster socket a 1 MB buffer fails with "Outbound message
+    /// too long", so use 64 KB and rely on request depth for throughput.
+    /// Only meaningful for `get`/`put`, not for `rm` and other short operations.
+    static let transferFlags = ["-B", "65536", "-R", "64"]
 
     /// Build SFTP connection arguments, multiplexing over the tunnel's existing
     /// SSH connection. The master has already authenticated, so no credentials
