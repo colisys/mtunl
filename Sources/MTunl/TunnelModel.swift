@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 import TunnelCore
 
 /// Bridges the UI to the daemon. Tunnels run in `mtunlctl serve`, so they keep
@@ -14,10 +15,12 @@ final class TunnelModel: ObservableObject {
     @Published private(set) var mihomoStatus = MihomoStatus()
     @Published var errorMessage: String?
 
-    private let store = ConfigStore()
+    private var store = ConfigStore()
     private let client = ControlClient()
     private var pollTask: Task<Void, Never>?
     private var launching = false
+    /// Keeps SFTP browser windows alive for the lifetime of the app.
+    private var sftpWindows: [UUID: NSWindow] = [:]
     private static let statusPollInterval: UInt64 = 500_000_000
 
     init() {
@@ -137,7 +140,18 @@ final class TunnelModel: ObservableObject {
         alert.messageText = "目标 SSH 需要登录密码"
         alert.informativeText = "\(status.name) 的密钥认证未通过，服务器支持密码登录。密码仅保存在内存中，停止或认证失败后清除。"
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        alert.accessoryView = field
+        let saveCheckbox = NSButton(
+            checkboxWithTitle: "保存到钥匙串，以后自动认证",
+            target: nil, action: nil
+        )
+        saveCheckbox.state = config(for: status.id).map { MTunlKeychain.hasPassword(for: $0) } == true ? .on : .off
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 280, height: 56))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.addArrangedSubview(field)
+        stack.addArrangedSubview(saveCheckbox)
+        alert.accessoryView = stack
         alert.addButton(withTitle: "继续认证")
         alert.addButton(withTitle: "取消并停止")
         NSApp.activate(ignoringOtherApps: true)
@@ -146,10 +160,18 @@ final class TunnelModel: ObservableObject {
         field.stringValue = ""
         guard statuses[status.id]?.passwordRequestID == token else { return }
         if response == .alertFirstButtonReturn && !password.isEmpty {
+            if saveCheckbox.state == .on, let config = config(for: status.id) {
+                MTunlKeychain.savePassword(password, for: config)
+            }
             send("startSession", target: status.id.uuidString, oneTimePassword: password, passwordRequestID: token)
         } else {
             send("stop", target: status.id.uuidString)
         }
+    }
+
+    /// Find the tunnel config for a status id (same UUID space).
+    private func config(for id: UUID) -> TunnelConfig? {
+        configs.first { $0.id == id }
     }
 
     func status(for config: TunnelConfig) -> TunnelStatus? { statuses[config.id] }
@@ -236,6 +258,35 @@ final class TunnelModel: ObservableObject {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             process.arguments = ["-e", script]
             try process.run()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+    
+    /// Opens the SFTP file browser in a new window
+    func openSFTPBrowser(_ config: TunnelConfig) {
+        do {
+            try config.validate()
+            guard config.kind.usesSSH else {
+                errorMessage = "SFTP 仅支持 SSH 隧道"
+                return
+            }
+            
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "SFTP - \(config.name)"
+            window.center()
+            window.contentView = NSHostingView(rootView: SFTPBrowserView(config: config))
+            window.makeKeyAndOrderFront(nil)
+            
+            // Hold a strong reference so the window is not deallocated immediately.
+            sftpWindows[config.id] = window
+            
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

@@ -285,6 +285,16 @@ extension TunnelSupervisor {
             return
         }
         if entry.usesBridge && status == 79 && !signaled && entry.oneTimePassword == nil && entry.sshTarget != nil {
+            // Auto-fill from the keychain when a password is stored for this
+            // server. A wrong stored password falls into the auth-failure
+            // branch below, so this cannot loop.
+            if let stored = MTunlKeychain.loadPassword(for: entry.config) {
+                entry.oneTimePassword = stored
+                entry.passwordRequestID = nil
+                entry.message = "使用钥匙串密码重试认证"
+                entry.attempts = 0
+                return launch(entry)
+            }
             entry.desired = false
             entry.relaunchNow = false
             entry.state = .failed
