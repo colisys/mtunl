@@ -213,12 +213,16 @@ public enum SFTPClient {
         }
     }
     
-    /// Delete a remote directory
+    /// Delete a remote directory and everything inside it. The sftp protocol
+    /// on macOS has no recursive delete (`rmdir` only removes empty dirs), so
+    /// run `rm -rf` on the remote shell over the tunnel instead. Note this
+    /// follows neither shell-level globs here: the path is quoted, and a
+    /// symlink is removed as a link rather than followed.
     public static func deleteDirectory(remotePath: String, config: TunnelConfig) async throws {
-        let sftpArgs = try sftpCommand(for: config)
-        let batchCommands = "rmdir \(Self.escapeSFTPArg(remotePath))\nbye\n"
+        let command = "rm -rf \(Self.escapeShellArg(remotePath))"
+        let args = try sshCommand(for: config) + [command]
         
-        let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config)
+        let (output, status) = try await runSSHCommand(args: args, config: config)
         
         guard status == 0 else {
             throw SFTPError.commandFailed("删除目录失败: \(output)")
