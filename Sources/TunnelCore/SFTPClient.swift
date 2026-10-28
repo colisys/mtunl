@@ -81,13 +81,19 @@ public enum SFTPError: LocalizedError, Equatable {
 /// SFTP client that wraps the system `sftp` command and can multiplex over
 /// an existing SSH control socket from a running tunnel.
 public enum SFTPClient {
-    
+    /// Pipelining flags for file transfers. `-B` raises the buffer from 32 KB
+    /// to 1 MB and `-R` allows 64 outstanding requests; without them a single
+    /// multiplexed channel waits for each reply, collapsing throughput on
+    /// higher-latency links. Only meaningful for `get`/`put`, not for `rm`
+    /// and other short operations.
+    static let transferFlags = ["-B", "1048576", "-R", "64"]
+
     /// Build SFTP connection arguments, multiplexing over the tunnel's existing
     /// SSH connection. The master has already authenticated, so no credentials
     /// are needed here and none are passed to child processes.
-    public static func sftpCommand(for config: TunnelConfig) throws -> [String] {
+    public static func sftpCommand(for config: TunnelConfig, transferOptions: [String] = []) throws -> [String] {
         let socketPath = CommandBuilder.sshControlPath(for: config)
-        var args = [
+        var args = transferOptions + [
             "-o", "ControlMaster=no",
             "-o", "ControlPath=\(socketPath)",
             "-o", "StrictHostKeyChecking=accept-new",
@@ -167,11 +173,12 @@ public enum SFTPClient {
     }
     
     /// Download a file from remote to local, multiplexing over the tunnel's
-    /// ControlMaster: the master already authenticated, so no credentials are
-    /// needed here and none are passed to the child process.
+    /// ControlMaster. `-R`/`-B` raise the in-flight request depth and buffer
+    /// size: a single multiplexed channel otherwise serializes one read per
+    /// round trip, which collapses throughput to RTT-bound speeds.
     public static func download(remotePath: String, localPath: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws {
         try Task.checkCancellation()
-        let sftpArgs = try sftpCommand(for: config)
+        let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
         let batchCommands = "get -r \(Self.escapeSFTPArg(remotePath)) \(Self.escapeSFTPArg(localPath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config, onProcessStart: onProcessStart)
@@ -184,7 +191,7 @@ public enum SFTPClient {
     /// Upload a file from local to remote, multiplexing over the tunnel's ControlMaster.
     public static func upload(localPath: String, remotePath: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws {
         try Task.checkCancellation()
-        let sftpArgs = try sftpCommand(for: config)
+        let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
         let batchCommands = "put -r \(Self.escapeSFTPArg(localPath)) \(Self.escapeSFTPArg(remotePath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config, onProcessStart: onProcessStart)
