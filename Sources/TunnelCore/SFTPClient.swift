@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// SFTP operation types
@@ -56,6 +57,31 @@ public struct SFTPBatchItem: Identifiable, Codable, Sendable {
     }
 }
 
+public enum ChunkState: Equatable, Sendable {
+    case pending
+    case running(Double)
+    case retrying(Int)
+    case done
+    case failed
+}
+
+private final class LockedData: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func append(_ data: Data) {
+        lock.lock()
+        storage.append(data)
+        lock.unlock()
+    }
+
+    var data: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 public enum SFTPError: LocalizedError, Equatable {
     case connectionFailed(String)
     case commandFailed(String)
@@ -87,7 +113,7 @@ public enum SFTPClient {
     /// over a ControlMaster socket a 1 MB buffer fails with "Outbound message
     /// too long", so use 64 KB and rely on request depth for throughput.
     /// Only meaningful for `get`/`put`, not for `rm` and other short operations.
-    static let transferFlags = ["-B", "65536", "-R", "64"]
+    private static let transferFlags: [String] = ["-B", "65536", "-R", "64"]
 
     /// Build SFTP connection arguments, multiplexing over the tunnel's existing
     /// SSH connection. The master has already authenticated, so no credentials
@@ -118,7 +144,7 @@ public enum SFTPClient {
     
     /// Build SSH command arguments for running remote commands, multiplexing
     /// over the tunnel's ControlMaster.
-    private static func sshCommand(for config: TunnelConfig) throws -> [String] {
+    static func sshCommand(for config: TunnelConfig) throws -> [String] {
         let socketPath = CommandBuilder.sshControlPath(for: config)
         var args = [
             "-o", "ControlMaster=no",
@@ -212,6 +238,7 @@ public enum SFTPClient {
     public static let chunkSize: Int64 = 16 * 1024 * 1024
     /// Parallel sftp workers per transfer.
     public static let chunkWorkers = 8
+    public static let chunkMaxAttempts = 3
 
     /// Byte ranges covering `size`: every chunk except the last is
     /// `chunkSize` long. Pure for unit testing.
@@ -234,19 +261,50 @@ public enum SFTPClient {
 
     /// Uploads `localPath` to `remotePath` in parallel chunks over independent
     /// multiplexed channels, then concatenates the parts on the remote shell.
-    /// Any failure removes the leftover parts before rethrowing.
+    ///
+    /// - Each part is verified with md5 after upload; mismatch counts as failure.
+    /// - A failed part is retried up to `maxAttempts`, dropping the remote part
+    ///   before each retry so a half-written file is never reused.
+    /// - Verified parts from an earlier interrupted run are detected by md5 and
+    ///   skipped, so pause/resume only transfers the missing chunks.
+    /// - On cancellation the remote parts are left in place for the next run;
+    ///   real errors clean them up.
+    /// - `onStateChange` reports the per-chunk state for the UI heatmap.
     public static func uploadChunked(
         localPath: String, remotePath: String, config: TunnelConfig,
-        size: Int64, workers: Int = SFTPClient.chunkWorkers
+        size: Int64, workers: Int = SFTPClient.chunkWorkers,
+        maxAttempts: Int = SFTPClient.chunkMaxAttempts,
+        isCancelled: @escaping () -> Bool = { Task.isCancelled },
+        onProcessStart: @escaping (Process) -> Void = { _ in },
+        onStateChange: @escaping ([Int: ChunkState]) -> Void = { _ in }
     ) async throws {
         let ranges = chunkRanges(size: size)
         let parts = ranges.indices.map { partPath(for: remotePath, index: $0) }
+        let lock = NSLock()
+        var states: [Int: ChunkState] = Dictionary(uniqueKeysWithValues: ranges.indices.map { ($0, .pending) })
+
+        func report(_ index: Int, _ state: ChunkState) {
+            lock.lock()
+            states[index] = state
+            let snapshot = states
+            lock.unlock()
+            onStateChange(snapshot)
+        }
 
         do {
             try await runParallel(workers: workers, jobs: ranges.indices) { index in
                 let slice = ranges[index]
-                // dd-style slice extraction: each worker uploads a plain,
-                // self-contained part file.
+
+                // Resume: a remote part from an interrupted run is reused
+                // only when its md5 matches the local slice exactly.
+                if let sliceMD5 = localSliceMD5(source: localPath, offset: slice.offset, length: slice.length),
+                   let existingMD5 = try? await SFTPClient.remoteMD5(parts[index], config: config),
+                   existingMD5 == sliceMD5 {
+                    report(index, .done)
+                    return
+                }
+
+                // Slice once locally; every retry reuses the same bytes.
                 let temp = URL(fileURLWithPath: NSTemporaryDirectory())
                     .appendingPathComponent("mtunl-chunk-\(UUID().uuidString)")
                 defer { try? FileManager.default.removeItem(at: temp) }
@@ -254,25 +312,69 @@ public enum SFTPClient {
                     source: localPath, destination: temp.path,
                     offset: slice.offset, length: slice.length
                 )
-                let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
-                let batch = "put \(Self.escapeSFTPArg(temp.path)) \(Self.escapeSFTPArg(parts[index]))\nbye\n"
-                let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batch, config: config)
-                guard status == 0 else {
-                    throw SFTPError.commandFailed("分块上传失败: \(output)")
+                let expectedMD5 = md5Hex(of: temp)
+
+                var lastError: Error?
+                for attempt in 1...max(maxAttempts, 1) {
+                    try Task.checkCancellation()
+                    if isCancelled() { throw CancellationError() }
+                    report(index, attempt == 1 ? .running(0) : .retrying(attempt))
+                    do {
+                        let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
+                        let batch = "put \(Self.escapeSFTPArg(temp.path)) \(Self.escapeSFTPArg(parts[index]))\nbye\n"
+                        let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batch, config: config, onProcessStart: onProcessStart, onProgress: { fraction in
+                            report(index, .running(fraction))
+                        })
+                        guard status == 0 else {
+                            throw SFTPError.commandFailed("分块上传失败: \(output)")
+                        }
+                        // Verify the part actually matches what we sent.
+                        let actualMD5 = try await SFTPClient.remoteMD5(parts[index], config: config)
+                        guard actualMD5 == expectedMD5 else {
+                            throw SFTPError.commandFailed("分块 \(index) md5 不匹配")
+                        }
+                        report(index, .done)
+                        return
+                    } catch is CancellationError {
+                        // Drop only the part that was in flight; verified parts remain.
+                        _ = try? await runSSHCommand(
+                            args: sshCommand(for: config) + ["rm -f \(Self.escapeShellArg(parts[index]))"],
+                            config: config)
+                        throw CancellationError()
+                    } catch {
+                        lastError = error
+                        // Drop the possibly corrupt part before retrying.
+                        _ = try? await runSSHCommand(
+                            args: sshCommand(for: config) + ["rm -f \(Self.escapeShellArg(parts[index]))"],
+                            config: config)
+                        if attempt < maxAttempts {
+                            try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                        }
+                    }
                 }
+                report(index, .failed)
+                throw lastError ?? SFTPError.commandFailed("分块 \(index) 上传失败")
             }
 
-            // Assemble on the remote side and verify the resulting size.
+            // Assemble and verify the whole file on the remote side.
             let quoted = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
-            let command = "cat \(quoted) > \(Self.escapeShellArg(remotePath)) && rm -f \(quoted)"
+            let command = "cat \(quoted) > \(Self.escapeShellArg(remotePath))"
             let (output, status) = try await runSSHCommand(args: sshCommand(for: config) + [command], config: config)
             guard status == 0 else {
                 throw SFTPError.commandFailed("远端拼接失败: \(output)")
             }
-        } catch {
-            // Best effort cleanup; the original error matters more.
-            let quoted = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
+            let localMD5 = md5Hex(of: URL(fileURLWithPath: localPath))
+            let remoteMD5 = try await remoteMD5(remotePath, config: config)
+            guard localMD5 == remoteMD5 else {
+                throw SFTPError.commandFailed("整文件 md5 校验失败")
+            }
             _ = try? await runSSHCommand(args: sshCommand(for: config) + ["rm -f \(quoted)"], config: config)
+        } catch is CancellationError {
+            // Pause/cancel: keep verified remote parts so the next run resumes.
+            throw CancellationError()
+        } catch {
+            // Keep remote parts on failure too: a red chunk can be retried
+            // without retransferring green, verified chunks.
             throw error
         }
     }
@@ -280,53 +382,143 @@ public enum SFTPClient {
     /// Downloads `remotePath` in parallel chunks: each worker extracts its
     /// byte range into a remote temp part with dd, pulls it back, and the
     /// local slices are concatenated into `localPath`.
+    ///
+    /// Mirrors `uploadChunked`: per-part md5 verification, retries with part
+    /// drop, resume from verified local parts, parts kept on cancellation.
+    /// Local parts are deterministic `.mtunl-part-NNNN` files next to the
+    /// destination so an interrupted run can pick up where it stopped.
     public static func downloadChunked(
         remotePath: String, localPath: String, config: TunnelConfig,
-        size: Int64, workers: Int = SFTPClient.chunkWorkers
+        size: Int64, workers: Int = SFTPClient.chunkWorkers,
+        maxAttempts: Int = SFTPClient.chunkMaxAttempts,
+        isCancelled: @escaping () -> Bool = { Task.isCancelled },
+        onProcessStart: @escaping (Process) -> Void = { _ in },
+        onStateChange: @escaping ([Int: ChunkState]) -> Void = { _ in }
     ) async throws {
         let ranges = chunkRanges(size: size)
         let parts = ranges.indices.map { partPath(for: remotePath, index: $0) }
-        let localParts = ranges.indices.map { index in
-            URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("mtunl-chunk-\(UUID().uuidString)").path
+        let localParts = ranges.indices.map { localPartPath(for: localPath, index: $0) }
+        let lock = NSLock()
+        var states: [Int: ChunkState] = Dictionary(uniqueKeysWithValues: ranges.indices.map { ($0, .pending) })
+
+        func report(_ index: Int, _ state: ChunkState) {
+            lock.lock()
+            states[index] = state
+            let snapshot = states
+            lock.unlock()
+            onStateChange(snapshot)
         }
 
         do {
             try await runParallel(workers: workers, jobs: ranges.indices) { index in
                 let slice = ranges[index]
-                // GNU dd has iflag=skip_bytes,count_bytes; busybox/BSD dd do
-                // not, so fall back to a pure-shell tail+head pipe there.
-                let gnu = "dd if=\(Self.escapeShellArg(remotePath)) of=\(Self.escapeShellArg(parts[index])) bs=1M iflag=skip_bytes,count_bytes skip=\(slice.offset) count=\(slice.length) 2>/dev/null"
-                let portable = "tail -c +\(slice.offset + 1) \(Self.escapeShellArg(remotePath)) | head -c \(slice.length) > \(Self.escapeShellArg(parts[index]))"
-                let command = "\(gnu) 2>/dev/null || \(portable)"
-                let (output, status) = try await runSSHCommand(args: sshCommand(for: config) + [command], config: config)
-                guard status == 0 else {
-                    throw SFTPError.commandFailed("远端分块失败: \(output)")
+                let localPart = localParts[index]
+
+                // Resume: a local part left over from an interrupted run is
+                // reused only when its md5 matches what the remote slice has.
+                if FileManager.default.fileExists(atPath: localPart),
+                   let partMD5 = md5HexIfComplete(localPart, length: slice.length),
+                   let existingMD5 = try? await SFTPClient.remoteMD5(parts[index], config: config),
+                   existingMD5 == partMD5 {
+                    report(index, .done)
+                    return
                 }
 
-                let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
-                let batch = "get \(Self.escapeSFTPArg(parts[index])) \(Self.escapeSFTPArg(localParts[index]))\nbye\n"
-                let (sftpOutput, sftpStatus) = try await runSFTPBatch(args: sftpArgs, batchCommands: batch, config: config)
-                guard sftpStatus == 0 else {
-                    throw SFTPError.commandFailed("分块下载失败: \(sftpOutput)")
+                var lastError: Error?
+                for attempt in 1...max(maxAttempts, 1) {
+                    try Task.checkCancellation()
+                    if isCancelled() { throw CancellationError() }
+                    report(index, attempt == 1 ? .running(0) : .retrying(attempt))
+                    do {
+                        // GNU dd has iflag=skip_bytes,count_bytes; busybox/BSD
+                        // dd do not, so fall back to a tail+head pipe there.
+                        let gnu = "dd if=\(Self.escapeShellArg(remotePath)) of=\(Self.escapeShellArg(parts[index])) bs=1M iflag=skip_bytes,count_bytes skip=\(slice.offset) count=\(slice.length) 2>/dev/null"
+                        let portable = "tail -c +\(slice.offset + 1) \(Self.escapeShellArg(remotePath)) | head -c \(slice.length) > \(Self.escapeShellArg(parts[index]))"
+                        let command = "\(gnu) 2>/dev/null || \(portable)"
+                        let (output, status) = try await runSSHCommand(args: sshCommand(for: config) + [command], config: config)
+                        guard status == 0 else {
+                            throw SFTPError.commandFailed("远端分块失败: \(output)")
+                        }
+
+                        let sftpArgs = try sftpCommand(for: config, transferOptions: transferFlags)
+                        let batch = "get \(Self.escapeSFTPArg(parts[index])) \(Self.escapeSFTPArg(localPart))\nbye\n"
+                        let (sftpOutput, sftpStatus) = try await runSFTPBatch(args: sftpArgs, batchCommands: batch, config: config, onProcessStart: onProcessStart, onProgress: { fraction in
+                            report(index, .running(fraction))
+                        })
+                        guard sftpStatus == 0 else {
+                            throw SFTPError.commandFailed("分块下载失败: \(sftpOutput)")
+                        }
+                        // Verify the pulled part byte-for-byte against the
+                        // remote slice before trusting it.
+                        let partMD5 = md5Hex(of: URL(fileURLWithPath: localPart))
+                        let actualMD5 = try await SFTPClient.remoteMD5(parts[index], config: config)
+                        guard partMD5 == actualMD5 else {
+                            throw SFTPError.commandFailed("分块 \(index) md5 不匹配")
+                        }
+                        report(index, .done)
+                        return
+                    } catch is CancellationError {
+                        // Drop only the part that was in flight; verified local parts remain.
+                        try? FileManager.default.removeItem(atPath: localPart)
+                        _ = try? await runSSHCommand(
+                            args: sshCommand(for: config) + ["rm -f \(Self.escapeShellArg(parts[index]))"],
+                            config: config)
+                        throw CancellationError()
+                    } catch {
+                        lastError = error
+                        try? FileManager.default.removeItem(atPath: localPart)
+                        _ = try? await runSSHCommand(
+                            args: sshCommand(for: config) + ["rm -f \(Self.escapeShellArg(parts[index]))"],
+                            config: config)
+                        if attempt < maxAttempts {
+                            try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                        }
+                    }
                 }
+                report(index, .failed)
+                throw lastError ?? SFTPError.commandFailed("分块 \(index) 下载失败")
             }
 
-            // Concatenate the local parts into the destination.
+            try Task.checkCancellation()
+            if isCancelled() { throw CancellationError() }
+
+            // Concatenate the verified local parts into the destination.
             FileManager.default.createFile(atPath: localPath, contents: nil)
             let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: localPath))
             defer { try? handle.close() }
             for path in localParts {
-                defer { try? FileManager.default.removeItem(atPath: path) }
                 let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped)
                 try handle.write(contentsOf: data)
             }
-        } catch {
-            let quoted = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
-            _ = try? await runSSHCommand(args: sshCommand(for: config) + ["rm -f \(quoted)"], config: config)
+            // Whole-file verification, then drop the parts.
+            let localMD5 = md5Hex(of: URL(fileURLWithPath: localPath))
+            let remoteMD5 = try await remoteMD5(remotePath, config: config)
+            guard localMD5 == remoteMD5 else {
+                throw SFTPError.commandFailed("整文件 md5 校验失败")
+            }
             for path in localParts { try? FileManager.default.removeItem(atPath: path) }
+            let quotedParts = parts.map { Self.escapeShellArg($0) }.joined(separator: " ")
+            _ = try? await runSSHCommand(args: sshCommand(for: config) + ["rm -f \(quotedParts)"], config: config)
+        } catch is CancellationError {
+            // Pause/cancel: keep verified local parts for the next run.
+            throw CancellationError()
+        } catch {
+            // Keep local parts on failure too: retry can reuse green chunks.
             throw error
         }
+    }
+
+    /// Deterministic local part path next to the destination file.
+    static func localPartPath(for localPath: String, index: Int) -> String {
+        "\(localPath).mtunl-part-\(String(format: "%04d", index))"
+    }
+
+    /// MD5 of `path` only when the file exists with exactly `length` bytes;
+    /// nil otherwise. Guards against reusing truncated leftovers.
+    static func md5HexIfComplete(_ path: String, length: Int64) -> String? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              (attrs[.size] as? NSNumber)?.int64Value == length else { return nil }
+        return md5Hex(of: URL(fileURLWithPath: path))
     }
 
     /// Copies `length` bytes at `offset` from `source` into `destination`.
@@ -691,7 +883,7 @@ public enum SFTPClient {
     
     // MARK: - Private helpers
     
-    private static func runSSHCommand(args: [String], config: TunnelConfig) async throws -> (output: String, exitCode: Int32) {
+    static func runSSHCommand(args: [String], config: TunnelConfig) async throws -> (output: String, exitCode: Int32) {
         try await withCheckedThrowingContinuation { continuation in
             // Run the blocking process I/O on a global queue so neither the
             // main thread nor the cooperative pool gets stuck.
@@ -722,7 +914,7 @@ public enum SFTPClient {
         }
     }
     
-    private static func runSFTPBatch(args: [String], batchCommands: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws -> (output: String, exitCode: Int32) {
+    private static func runSFTPBatch(args: [String], batchCommands: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil, onProgress: ((Double) -> Void)? = nil) async throws -> (output: String, exitCode: Int32) {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
@@ -733,10 +925,11 @@ public enum SFTPClient {
                 
                 let inputPipe = Pipe()
                 let outputPipe = Pipe()
+                let errorPipe = Pipe()
                 
                 process.standardInput = inputPipe
                 process.standardOutput = outputPipe
-                process.standardError = outputPipe
+                process.standardError = errorPipe
                 
                 do {
                     try process.run()
@@ -750,11 +943,42 @@ public enum SFTPClient {
                     }
                     try inputPipe.fileHandleForWriting.close()
                     
-                    // Read output asynchronously to avoid pipe buffer deadlock
-                    let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    // Read stdout and stderr concurrently so a verbose sftp
+                    // progress meter cannot block on either pipe. Progress
+                    // meters use carriage returns and contain e.g. "42%".
+                    let outputBox = LockedData()
+                    let errorBox = LockedData()
+                    let outputRead = DispatchWorkItem {
+                        outputBox.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+                    }
+                    let errorRead = DispatchWorkItem {
+                        let reader = errorPipe.fileHandleForReading
+                        var pending = ""
+                        while let data = try? reader.read(upToCount: 4096), !data.isEmpty {
+                            errorBox.append(data)
+                            guard let text = String(data: data, encoding: .utf8) else { continue }
+                            pending += text
+                            let lines = pending.split(omittingEmptySubsequences: true, whereSeparator: { $0 == "\r" || $0 == "\n" })
+                            let hasDelimiter = pending.last == "\r" || pending.last == "\n"
+                            pending = hasDelimiter ? "" : String(lines.last ?? "")
+                            let completed = hasDelimiter ? lines : lines.dropLast()
+                            for component in completed {
+                                guard let token = component.split(separator: "%").first,
+                                      let digits = token.split(whereSeparator: { !$0.isNumber }).last,
+                                      let value = Double(digits), value >= 0, value <= 100 else { continue }
+                                if let onProgress {
+                                    DispatchQueue.main.async { onProgress(value / 100) }
+                                }
+                            }
+                        }
+                    }
+                    DispatchQueue.global(qos: .utility).async(execute: outputRead)
+                    DispatchQueue.global(qos: .utility).async(execute: errorRead)
                     process.waitUntilExit()
+                    outputRead.wait()
+                    errorRead.wait()
                     
-                    let output = String(data: data, encoding: .utf8) ?? ""
+                    let output = String(data: outputBox.data + errorBox.data, encoding: .utf8) ?? ""
                     continuation.resume(returning: (output, process.terminationStatus))
                 } catch {
                     continuation.resume(throwing: SFTPError.commandFailed(error.localizedDescription))
@@ -832,7 +1056,7 @@ public enum SFTPClient {
         )
     }
     
-    private static func escapeShellArg(_ arg: String) -> String {
+    static func escapeShellArg(_ arg: String) -> String {
         "'\(arg.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
     

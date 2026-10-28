@@ -530,7 +530,7 @@ struct TransferQueueBar: View {
             Divider()
 
             List(queue.items) { item in
-                TransferItemRow(item: item) { queue.cancel(item) }
+                TransferItemRow(item: item, onCancel: { queue.cancel(item) }, onPause: { queue.pause(item) }, onResume: { queue.resume(item) }, onRetry: { queue.retry(item) })
                     .listRowInsets(EdgeInsets(top: 2, leading: 10, bottom: 2, trailing: 10))
             }
             .listStyle(.plain)
@@ -542,6 +542,9 @@ struct TransferQueueBar: View {
 struct TransferItemRow: View {
     @ObservedObject var item: TransferQueue.TransferItem
     let onCancel: () -> Void
+    let onPause: () -> Void
+    let onResume: () -> Void
+    let onRetry: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -552,6 +555,9 @@ struct TransferItemRow: View {
             case .running:
                 ProgressView()
                     .controlSize(.small)
+            case .paused:
+                Image(systemName: "pause.circle.fill")
+                    .foregroundStyle(.orange)
             case .completed:
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)
@@ -569,8 +575,13 @@ struct TransferItemRow: View {
                 .foregroundStyle(.secondary)
                 .help(item.direction == .upload ? "上传" : "下载")
 
-            Text(item.name)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.name).lineLimit(1)
+                if item.isChunked {
+                    ChunkHeatmap(states: item.chunkStates, onRetry: onRetry)
+                        .frame(height: 7)
+                }
+            }
 
             Spacer()
 
@@ -578,7 +589,31 @@ struct TransferItemRow: View {
                 .font(.caption)
                 .foregroundStyle(item.state == .failed ? .red : .secondary)
 
-            if item.state == .queued || item.state == .running {
+            if item.state == .running && item.isChunked {
+                Button(action: onPause) {
+                    Image(systemName: "pause.circle.fill")
+                        .foregroundStyle(.orange)
+                }
+                .buttonStyle(.plain)
+                .help("暂停并保留已完成分片")
+            }
+            if item.state == .paused {
+                Button(action: onResume) {
+                    Image(systemName: "play.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("继续传输")
+            }
+            if item.state == .failed || item.state == .cancelled {
+                Button(action: onRetry) {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("重试失败分片")
+            }
+            if item.state == .queued || item.state == .running || item.state == .paused {
                 Button(action: onCancel) {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
@@ -594,9 +629,48 @@ struct TransferItemRow: View {
         switch item.state {
         case .queued: return "排队中"
         case .running: return "传输中…"
+        case .paused: return "已暂停（分片已保留）"
         case .completed: return "已完成"
         case .failed: return item.error ?? "失败"
         case .cancelled: return "已取消"
+        }
+    }
+}
+
+private struct ChunkHeatmap: View {
+    let states: [Int: ChunkState]
+    let onRetry: () -> Void
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 5), spacing: 2)], spacing: 2) {
+            ForEach(states.keys.sorted(), id: \.self) { index in
+                Button {
+                    if case .failed = states[index] { onRetry() }
+                } label: {
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(color(for: states[index] ?? .pending))
+                        .frame(height: 5)
+                }
+                .buttonStyle(.plain)
+                .disabled(!isFailed(states[index]))
+                .help(isFailed(states[index]) ? "重试第 \(index + 1) 个分片" : "分片 \(index + 1)")
+            }
+        }
+        .help("绿色：已校验完成；蓝色：传输中；橙色：重试；红色：失败；灰色：等待。点击红色分片重试")
+    }
+
+    private func isFailed(_ state: ChunkState?) -> Bool {
+        if case .failed = state { return true }
+        return false
+    }
+
+    private func color(for state: ChunkState) -> Color {
+        switch state {
+        case .pending: return .secondary.opacity(0.35)
+        case .running(let fraction): return Color.blue.opacity(0.55 + fraction * 0.45)
+        case .retrying: return .orange
+        case .done: return .green
+        case .failed: return .red
         }
     }
 }

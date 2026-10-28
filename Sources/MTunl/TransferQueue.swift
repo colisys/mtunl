@@ -13,7 +13,7 @@ final class TransferQueue: ObservableObject {
     }
 
     enum State: Equatable {
-        case queued, running, completed, failed, cancelled
+        case queued, running, paused, completed, failed, cancelled
     }
 
     final class TransferItem: Identifiable, ObservableObject {
@@ -27,6 +27,7 @@ final class TransferQueue: ObservableObject {
 
         @Published var state: State = .queued
         @Published var error: String?
+        @Published var chunkStates: [Int: ChunkState] = [:]
 
         var task: Task<Void, Never>?
         var process: Process?
@@ -80,6 +81,31 @@ final class TransferQueue: ObservableObject {
         }
     }
 
+    func pause(_ item: TransferItem) {
+        guard item.state == .running, item.isChunked else { return }
+        item.state = .paused
+        item.task?.cancel()
+        if let process = item.process, process.isRunning { process.terminate() }
+        for process in item.chunkProcesses where process.isRunning { process.terminate() }
+    }
+
+    func resume(_ item: TransferItem) {
+        guard item.state == .paused else { return }
+        item.state = .queued
+        schedule()
+    }
+
+    /// Requeue a failed/cancelled chunked transfer. The transfer implementation
+    /// verifies existing parts and skips completed ones, so this retries only
+    /// failed or missing chunks rather than restarting the whole file.
+    func retry(_ item: TransferItem) {
+        guard item.isChunked,
+              item.state == .failed || item.state == .cancelled else { return }
+        item.error = nil
+        item.state = .queued
+        schedule()
+    }
+
     func cancel(_ item: TransferItem) {
         guard item.state == .queued || item.state == .running else { return }
         item.state = .cancelled
@@ -119,7 +145,13 @@ final class TransferQueue: ObservableObject {
                 if item.isChunked {
                     try await SFTPClient.uploadChunked(
                         localPath: item.localPath, remotePath: item.remotePath,
-                        config: item.config, size: item.size
+                        config: item.config, size: item.size,
+                        onProcessStart: { [weak item] process in
+                            Task { @MainActor in item?.chunkProcesses.append(process) }
+                        },
+                        onStateChange: { [weak item] states in
+                            Task { @MainActor in item?.chunkStates = states }
+                        }
                     )
                 } else {
                     try await SFTPClient.upload(
@@ -133,7 +165,13 @@ final class TransferQueue: ObservableObject {
                 if item.isChunked {
                     try await SFTPClient.downloadChunked(
                         remotePath: item.remotePath, localPath: item.localPath,
-                        config: item.config, size: item.size
+                        config: item.config, size: item.size,
+                        onProcessStart: { [weak item] process in
+                            Task { @MainActor in item?.chunkProcesses.append(process) }
+                        },
+                        onStateChange: { [weak item] states in
+                            Task { @MainActor in item?.chunkStates = states }
+                        }
                     )
                 } else {
                     try await SFTPClient.download(
@@ -146,9 +184,11 @@ final class TransferQueue: ObservableObject {
             }
             item.state = .completed
         } catch is CancellationError {
-            item.state = .cancelled
+            if item.state != .paused { item.state = .cancelled }
         } catch {
-            if Task.isCancelled {
+            if item.state == .paused {
+                // Pause keeps verified parts for resume.
+            } else if Task.isCancelled {
                 item.state = .cancelled
             } else {
                 item.state = .failed
