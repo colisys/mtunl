@@ -129,7 +129,7 @@ final class SFTPClientTests: XCTestCase {
         // 7z
         XCTAssertEqual(
             SFTPClient.extractCommand(for: "archive.7z", destinationPath: "/dest"),
-            "7z x -o'/dest' -y 'archive.7z'"
+            "7z x -y -o'/dest' 'archive.7z'"
         )
         
         // Single-file compression: .gz
@@ -159,6 +159,24 @@ final class SFTPClientTests: XCTestCase {
         let tarGzCmd = SFTPClient.extractCommand(for: "backup.tar.gz", destinationPath: "/dest")
         XCTAssertTrue(tarGzCmd!.contains("tar -xzf"))
         XCTAssertFalse(tarGzCmd!.contains("gunzip"))
+
+        // Overwrite=false changes the flags for archive tools with explicit modes
+        XCTAssertEqual(
+            SFTPClient.extractCommand(for: "archive.zip", destinationPath: "/dest", overwrite: false),
+            "unzip -n 'archive.zip' -d '/dest'"
+        )
+        XCTAssertEqual(
+            SFTPClient.extractCommand(for: "archive.rar", destinationPath: "/dest", overwrite: false),
+            "unrar x -o- 'archive.rar' '/dest'/"
+        )
+        XCTAssertEqual(
+            SFTPClient.extractCommand(for: "archive.7z", destinationPath: "/dest", overwrite: false),
+            "7z x -aos -o'/dest' 'archive.7z'"
+        )
+        // tar overwrites unconditionally; the flag must not appear
+        XCTAssertFalse(
+            SFTPClient.extractCommand(for: "backup.tar", destinationPath: "/dest", overwrite: false)!.contains("-n")
+        )
         
         // Case insensitivity
         XCTAssertNotNil(SFTPClient.extractCommand(for: "FILE.TAR.GZ", destinationPath: "/dest"))
@@ -180,5 +198,48 @@ final class SFTPClientTests: XCTestCase {
             SFTPClient.extractCommand(for: "/path/ar'chive.zip", destinationPath: "/de'st"),
             "unzip -o '/path/ar'\\''chive.zip' -d '/de'\\''st'"
         )
+    }
+
+    // MARK: - Compress command construction
+
+    func testCompressCommandFormats() {
+        let paths = ["/data/logs", "/data/file with space.txt"]
+        let escaped = "'/data/logs' '/data/file with space.txt'"
+
+        XCTAssertEqual(
+            SFTPClient.compressCommand(paths: paths, archivePath: "/out/a.tar.gz",
+                                       format: .tarGz, level: .best),
+            "tar -czf '/out/a.tar.gz' \(escaped)"
+        )
+        XCTAssertEqual(
+            SFTPClient.compressCommand(paths: paths, archivePath: "/out/a.tar.bz2",
+                                       format: .tarBz2, level: .fast),
+            "tar -cjf '/out/a.tar.bz2' \(escaped)"
+        )
+        XCTAssertEqual(
+            SFTPClient.compressCommand(paths: paths, archivePath: "/out/a.tar.xz",
+                                       format: .tarXz, level: .best),
+            "XZ_OPT=-9 tar -cJf '/out/a.tar.xz' \(escaped)"
+        )
+        XCTAssertEqual(
+            SFTPClient.compressCommand(paths: paths, archivePath: "/out/a.tar",
+                                       format: .tar, level: .best),
+            "tar -cf '/out/a.tar' \(escaped)"
+        )
+        XCTAssertEqual(
+            SFTPClient.compressCommand(paths: paths, archivePath: "/out/a.zip",
+                                       format: .zip, level: .fast),
+            "zip -1 -r '/out/a.zip' \(escaped)"
+        )
+        XCTAssertEqual(
+            SFTPClient.compressCommand(paths: paths, archivePath: "/out/a.7z",
+                                       format: .sevenZip, level: .balanced),
+            "7z a -mx=6 '/out/a.7z' \(escaped)"
+        )
+    }
+
+    func testCompressCommandRejectsEmptyPaths() {
+        XCTAssertNil(SFTPClient.compressCommand(
+            paths: [], archivePath: "/out/a.tar.gz", format: .tarGz, level: .balanced))
     }
 }

@@ -141,6 +141,13 @@ final class RemoteBrowserModel: ObservableObject {
     @Published var clipboardOperation: ClipboardOperation?
     @Published var showingNewFolder = false
     @Published var newFolderName = ""
+    /// Files staged in the delete confirmation sheet; empty means hidden.
+    @Published var pendingDeletion: [RemoteFile] = []
+    @Published var forceDelete = false
+    /// Set when the compress sheet should open; the view reads and clears it.
+    @Published var showingCompressSheet = false
+    /// Set when the extract sheet should open; the view reads and clears it.
+    @Published var showingExtractSheet = false
     /// Anchor index for shift-click range selection (Finder style).
     var selectionAnchor: Int?
 
@@ -259,7 +266,7 @@ final class RemoteBrowserModel: ObservableObject {
         isLoading = false
     }
 
-    func deleteSelected() async {
+    func deleteSelected(force: Bool) async {
         guard !selectedFiles.isEmpty else { return }
 
         isLoading = true
@@ -270,9 +277,9 @@ final class RemoteBrowserModel: ObservableObject {
         do {
             for file in targets {
                 if file.isDirectory {
-                    try await SFTPClient.deleteDirectory(remotePath: file.path, config: config)
+                    try await SFTPClient.deleteDirectory(remotePath: file.path, config: config, force: force)
                 } else {
-                    try await SFTPClient.deleteFile(remotePath: file.path, config: config)
+                    try await SFTPClient.deleteFile(remotePath: file.path, config: config, force: force)
                 }
             }
 
@@ -305,10 +312,9 @@ final class RemoteBrowserModel: ObservableObject {
         isLoading = false
     }
 
-    func compressSelected() async {
-        guard !selectedFiles.isEmpty else { return }
+    func compressSelected(format: SFTPClient.ArchiveFormat, level: SFTPClient.CompressionLevel, archiveName: String) async {
+        guard !selectedFiles.isEmpty, !archiveName.trimmingCharacters(in: .whitespaces).isEmpty else { return }
 
-        let archiveName = "archive-\(Int(Date().timeIntervalSince1970)).tar.gz"
         let archivePath = currentPath + "/" + archiveName
 
         isLoading = true
@@ -320,6 +326,8 @@ final class RemoteBrowserModel: ObservableObject {
             try await SFTPClient.compress(
                 remotePaths: targets.map { $0.path },
                 archivePath: archivePath,
+                format: format,
+                level: level,
                 config: config
             )
             await loadDirectory()
@@ -331,7 +339,7 @@ final class RemoteBrowserModel: ObservableObject {
         isLoading = false
     }
 
-    func decompressSelected() async {
+    func decompressSelected(to destination: String, overwrite: Bool) async {
         guard selectedFiles.count == 1 else { return }
 
         guard let file = files.first(where: { selectedFiles.contains($0.path) }) else {
@@ -343,12 +351,13 @@ final class RemoteBrowserModel: ObservableObject {
             errorMessage = "不支持的压缩格式。支持的格式：.tar.gz, .tgz, .tar.bz2, .tbz2, .tbz, .tar.xz, .txz, .tar, .zip, .rar, .7z, .gz, .bz2, .xz"
             return
         }
+        let target = destination.trimmingCharacters(in: .whitespaces).isEmpty ? currentPath : destination
 
         isLoading = true
         errorMessage = nil
 
         do {
-            try await SFTPClient.decompress(archivePath: file.path, destinationPath: currentPath, config: config)
+            try await SFTPClient.decompress(archivePath: file.path, destinationPath: target, overwrite: overwrite, config: config)
             await loadDirectory()
             selectedFiles.removeAll()
         } catch {
@@ -431,6 +440,18 @@ struct SFTPBrowserView: View {
             CredentialSheetView(config: remoteModel.config) {
                 Task { await remoteModel.loadDirectory() }
             }
+        }
+        .sheet(isPresented: $remoteModel.showingCompressSheet) {
+            CompressSheetView(model: remoteModel)
+        }
+        .sheet(isPresented: $remoteModel.showingExtractSheet) {
+            ExtractSheetView(model: remoteModel)
+        }
+        .sheet(isPresented: Binding(
+            get: { !remoteModel.pendingDeletion.isEmpty },
+            set: { if !$0 { remoteModel.pendingDeletion = [] } }
+        )) {
+            DeleteConfirmSheetView(model: remoteModel)
         }
     }
 
@@ -874,15 +895,19 @@ struct RemotePaneView: View {
 
                 Divider()
 
-                Button("压缩选中") {
-                    Task { await model.compressSelected() }
+                Button("压缩选中…") {
+                    if !model.selectedFiles.isEmpty { model.showingCompressSheet = true }
                 }
                 .disabled(model.selectedFiles.isEmpty)
 
-                Button("解压选中") {
-                    Task { await model.decompressSelected() }
+                Button("解压选中…") {
+                    if model.selectedFiles.count == 1, let file = model.files.first(where: { model.selectedFiles.contains($0.path) }),
+                       SFTPClient.isSupportedArchive(file.name) {
+                        model.showingExtractSheet = true
+                    }
                 }
-                .disabled(model.selectedFiles.count != 1)
+                .disabled(model.selectedFiles.count != 1
+                          || !model.files.contains { model.selectedFiles.contains($0.path) && SFTPClient.isSupportedArchive($0.name) })
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -974,9 +999,24 @@ struct RemotePaneView: View {
 
         Divider()
 
-        Button("删除", role: .destructive) {
+        Button("压缩…") {
             model.selectedFiles = [file.path]
-            Task { await model.deleteSelected() }
+            model.showingCompressSheet = true
+        }
+
+        if SFTPClient.isSupportedArchive(file.name) {
+            Button("解压…") {
+                model.selectedFiles = [file.path]
+                model.showingExtractSheet = true
+            }
+        }
+
+        Divider()
+
+        Button("删除…", role: .destructive) {
+            model.selectedFiles = [file.path]
+            model.pendingDeletion = model.files.filter { model.selectedFiles.contains($0.path) }
+            model.forceDelete = false
         }
     }
 
@@ -1108,4 +1148,247 @@ struct CredentialSheetView: View {
         host: "example.com",
         user: "user"
     ))
+}
+
+// MARK: - Delete Confirmation
+
+/// Confirmation before deleting remote items. "Force delete" adds `-f` so
+/// write-protected files are removed without asking; unchecked, failures are
+/// reported instead of silenced.
+struct DeleteConfirmSheetView: View {
+    @ObservedObject var model: RemoteBrowserModel
+    @Environment(\.dismiss) private var dismiss
+
+    private var hasDirectory: Bool {
+        model.pendingDeletion.contains(where: \.isDirectory)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("确认删除", systemImage: "trash")
+                .font(.headline)
+
+            Text(deleteSummary)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(model.pendingDeletion.prefix(5)) { file in
+                    Text(file.path)
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if model.pendingDeletion.count > 5 {
+                    Text("以及另外 \(model.pendingDeletion.count - 5) 项…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+
+            Toggle(isOn: $model.forceDelete) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("强制删除（rm -f）")
+                    Text("不再报告无法删除的文件；写保护的文件也会被直接移除")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.checkbox)
+
+            HStack {
+                Spacer()
+                Button("取消", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("删除", role: .destructive) {
+                    let force = model.forceDelete
+                    dismiss()
+                    Task { await model.deleteSelected(force: force) }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
+    private var deleteSummary: String {
+        let directories = model.pendingDeletion.filter(\.isDirectory).count
+        let files = model.pendingDeletion.count - directories
+        var parts: [String] = []
+        if directories > 0 { parts.append("\(directories) 个文件夹（含全部内容）") }
+        if files > 0 { parts.append("\(files) 个文件") }
+        return "将永久删除 " + parts.joined(separator: " 和 ") + "，此操作不可撤销。"
+    }
+}
+
+// MARK: - Compress Sheet
+
+/// Options for building a remote archive: name, format and compression level.
+struct CompressSheetView: View {
+    @ObservedObject var model: RemoteBrowserModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var format: SFTPClient.ArchiveFormat = .tarGz
+    @State private var level: SFTPClient.CompressionLevel = .balanced
+    @State private var name: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("压缩", systemImage: "doc.zipper")
+                .font(.headline)
+
+            Text("将 \(model.selectedFiles.count) 个选中项打包到当前目录")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            field("压缩包名称") {
+                HStack(spacing: 4) {
+                    TextField("archive", text: $name)
+                        .textFieldStyle(.roundedBorder)
+                    Text(format.rawValue)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            field("格式") {
+                Picker("格式", selection: $format) {
+                    ForEach(SFTPClient.ArchiveFormat.allCases) { candidate in
+                        Text(candidate.label).tag(candidate)
+                    }
+                }
+                .labelsHidden()
+            }
+
+            field("压缩等级") {
+                Picker("压缩等级", selection: $level) {
+                    ForEach(SFTPClient.CompressionLevel.allCases) { candidate in
+                        Text(candidate.label).tag(candidate)
+                    }
+                }
+                .labelsHidden()
+                .disabled(!supportsLevel)
+            }
+
+            if !supportsLevel {
+                Text("该格式不使用压缩等级")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Spacer()
+                Button("取消", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("压缩") {
+                    let trimmed = name.trimmingCharacters(in: .whitespaces)
+                    let finalName = trimmed.isEmpty ? "archive" : trimmed
+                    dismiss()
+                    Task { await model.compressSelected(
+                        format: format, level: level, archiveName: finalName + format.rawValue
+                    ) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+        .onAppear {
+            if name.isEmpty {
+                name = "archive-\(Int(Date().timeIntervalSince1970))"
+            }
+        }
+    }
+
+    private var supportsLevel: Bool {
+        switch format {
+        case .tarGz, .tarBz2, .tarXz, .zip, .sevenZip: return true
+        case .tar: return false
+        }
+    }
+
+    private func field<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            content()
+        }
+    }
+}
+
+// MARK: - Extract Sheet
+
+/// Options for extracting a remote archive: destination and overwrite policy.
+struct ExtractSheetView: View {
+    @ObservedObject var model: RemoteBrowserModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var destination: String = ""
+    @State private var overwrite = true
+
+    private var archive: RemoteFile? {
+        model.files.first { model.selectedFiles.contains($0.path) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("解压", systemImage: "archivebox")
+                .font(.headline)
+
+            if let archive {
+                Text("\(archive.name) → 指定目录")
+                    .font(.callout.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+            }
+
+            field("解压到") {
+                TextField("目标目录（绝对路径）", text: $destination)
+                    .textFieldStyle(.roundedBorder)
+                Button("当前目录") { destination = model.currentPath }
+                    .buttonStyle(.bordered)
+            }
+
+            Toggle(isOn: $overwrite) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("覆盖已有文件")
+                    Text("关闭时跳过已存在的同名文件")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.checkbox)
+
+            HStack {
+                Spacer()
+                Button("取消", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("解压") {
+                    let target = destination
+                    let overwriteFlag = overwrite
+                    dismiss()
+                    Task { await model.decompressSelected(to: target, overwrite: overwriteFlag) }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onAppear {
+            if destination.isEmpty { destination = model.currentPath }
+        }
+    }
+
+    private func field<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            content()
+        }
+    }
 }

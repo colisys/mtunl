@@ -202,9 +202,12 @@ public enum SFTPClient {
     }
     
     /// Delete a remote file
-    public static func deleteFile(remotePath: String, config: TunnelConfig) async throws {
+    /// Delete a remote file. Without `force`, `rm` reports a missing file as
+    /// an error; with it, errors are silenced by the shell flag.
+    public static func deleteFile(remotePath: String, config: TunnelConfig, force: Bool = false) async throws {
         let sftpArgs = try sftpCommand(for: config)
-        let batchCommands = "rm \(Self.escapeSFTPArg(remotePath))\nbye\n"
+        let flag = force ? "-f " : ""
+        let batchCommands = "rm \(flag)\(Self.escapeSFTPArg(remotePath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config)
         
@@ -215,11 +218,11 @@ public enum SFTPClient {
     
     /// Delete a remote directory and everything inside it. The sftp protocol
     /// on macOS has no recursive delete (`rmdir` only removes empty dirs), so
-    /// run `rm -rf` on the remote shell over the tunnel instead. Note this
-    /// follows neither shell-level globs here: the path is quoted, and a
-    /// symlink is removed as a link rather than followed.
-    public static func deleteDirectory(remotePath: String, config: TunnelConfig) async throws {
-        let command = "rm -rf \(Self.escapeShellArg(remotePath))"
+    /// run `rm -rf` on the remote shell over the tunnel instead. `force`
+    /// controls whether `-f` is passed; without it permission problems are
+    /// reported instead of silenced.
+    public static func deleteDirectory(remotePath: String, config: TunnelConfig, force: Bool = false) async throws {
+        let command = "rm -r\(force ? "f" : "") \(Self.escapeShellArg(remotePath))"
         let args = try sshCommand(for: config) + [command]
         
         let (output, status) = try await runSSHCommand(args: args, config: config)
@@ -289,33 +292,88 @@ public enum SFTPClient {
         }
     }
     
-    /// Compress remote files/directories using tar
-    public static func compress(remotePaths: [String], archivePath: String, config: TunnelConfig) async throws {
-        let socketPath = CommandBuilder.sshControlPath(for: config)
-        var args = [
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=\(socketPath)",
-            "-o", "StrictHostKeyChecking=ask",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-        ]
-        
-        if let port = config.sshPort {
-            args += ["-p", String(port)]
+    /// Remote archive formats offered in the UI, in menu order.
+    public enum ArchiveFormat: String, CaseIterable, Identifiable, Sendable {
+        case tarGz = ".tar.gz"
+        case tarBz2 = ".tar.bz2"
+        case tarXz = ".tar.xz"
+        case tar = ".tar"
+        case zip = ".zip"
+        case sevenZip = ".7z"
+
+        public var id: String { rawValue }
+        public var label: String {
+            switch self {
+            case .tarGz: return "tar.gz（兼容性最好）"
+            case .tarBz2: return "tar.bz2"
+            case .tarXz: return "tar.xz（压缩率最高，最慢）"
+            case .tar: return "tar（仅打包，不压缩）"
+            case .zip: return "zip（Windows 友好）"
+            case .sevenZip: return "7z（需远端安装 7z）"
+            }
         }
-        if let identity = config.identityFile, !identity.isEmpty {
-            args += ["-i", identity]
+    }
+
+    /// Compression strength for formats that support a level flag.
+    public enum CompressionLevel: Int, CaseIterable, Identifiable, Sendable {
+        case fast = 1
+        case balanced = 6
+        case best = 9
+
+        public var id: Int { rawValue }
+        public var label: String {
+            switch self {
+            case .fast: return "快（等级 \(rawValue)）"
+            case .balanced: return "均衡（等级 \(rawValue)）"
+            case .best: return "最小体积（等级 \(rawValue)）"
+            }
         }
-        if let jump = config.jumpHost, !jump.isEmpty {
-            args += ["-J", jump]
+    }
+
+    /// Build the remote shell command that compresses `paths` into
+    /// `archivePath` with the chosen format and level, or `nil` if the
+    /// arguments are invalid. Pure for unit testing.
+    public static func compressCommand(
+        paths: [String], archivePath: String,
+        format: ArchiveFormat, level: CompressionLevel
+    ) -> String? {
+        guard !paths.isEmpty else { return nil }
+        let targets = paths.map { escapeShellArg($0) }.joined(separator: " ")
+        let archive = escapeShellArg(archivePath)
+
+        switch format {
+        case .tarGz:
+            return "tar -czf \(archive) \(targets)"
+        case .tarBz2:
+            return "tar -cjf \(archive) \(targets)"
+        case .tarXz:
+            // Pass the level through to xz via XZ_OPT; tar's -J flag hides it.
+            return "XZ_OPT=-\(level.rawValue) tar -cJf \(archive) \(targets)"
+        case .tar:
+            return "tar -cf \(archive) \(targets)"
+        case .zip:
+            return "zip -\(level.rawValue) -r \(archive) \(targets)"
+        case .sevenZip:
+            return "7z a -mx=\(level.rawValue) \(archive) \(targets)"
         }
-        
-        let paths = remotePaths.map { Self.escapeShellArg($0) }.joined(separator: " ")
-        let command = "tar -czf \(Self.escapeShellArg(archivePath)) \(paths)"
-        args += ["--", config.destination, command]
-        
+    }
+
+    /// Compress remote files/directories on the remote shell over the tunnel.
+    public static func compress(
+        remotePaths: [String], archivePath: String,
+        format: ArchiveFormat = .tarGz, level: CompressionLevel = .balanced,
+        config: TunnelConfig
+    ) async throws {
+        guard let command = compressCommand(
+            paths: remotePaths, archivePath: archivePath,
+            format: format, level: level
+        ) else {
+            throw SFTPError.commandFailed("压缩参数无效")
+        }
+        let args = try sshCommand(for: config) + [command]
+
         let (output, status) = try await runSSHCommand(args: args, config: config)
-        
+
         guard status == 0 else {
             throw SFTPError.commandFailed("压缩失败: \(output)")
         }
@@ -331,13 +389,17 @@ public enum SFTPClient {
     ///
     /// Exposed for unit testing: the command construction must stay pure and
     /// must not touch the network.
-    public static func extractCommand(for archivePath: String, destinationPath: String) -> String? {
+    public static func extractCommand(
+        for archivePath: String, destinationPath: String, overwrite: Bool = true
+    ) -> String? {
         let lower = archivePath.lowercased()
         let archive = escapeShellArg(archivePath)
         let dest = escapeShellArg(destinationPath)
 
         // Compound tar formats must be tested before the plain `.gz`/`.bz2`/`.xz`
         // single-file branches, otherwise `.tar.gz` would match `.gz`.
+        // tar overwrites by default; extraction into the target directory is
+        // the same either way, so `overwrite` only matters for zip/7z/rar.
         if lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tgz") {
             return "tar -xzf \(archive) -C \(dest)"
         }
@@ -351,16 +413,17 @@ public enum SFTPClient {
             return "tar -xf \(archive) -C \(dest)"
         }
         if lower.hasSuffix(".zip") {
-            return "unzip -o \(archive) -d \(dest)"
+            return "unzip \(overwrite ? "-o" : "-n") \(archive) -d \(dest)"
         }
         if lower.hasSuffix(".rar") {
             // unrar wants the destination directory as a separate argument;
             // the trailing slash forces extraction into that directory.
-            return "unrar x -o+ \(archive) \(dest)/"
+            return "unrar x \(overwrite ? "-o+" : "-o-") \(archive) \(dest)/"
         }
         if lower.hasSuffix(".7z") {
             // 7z expects -o<dir> with no space; the shell strips the quotes.
-            return "7z x -o\(dest) -y \(archive)"
+            // -y assumes yes on every prompt; -aos skips existing files.
+            return "7z x \(overwrite ? "-y" : "-aos") -o\(dest) \(archive)"
         }
         if lower.hasSuffix(".gz") {
             return singleFileCommand(tool: "gunzip", suffix: ".gz",
@@ -390,32 +453,17 @@ public enum SFTPClient {
     }
 
     /// Decompress remote archive (supports tar.gz, tar.bz2, tar.xz, tar, zip, rar, 7z, gz, bz2, xz)
-    public static func decompress(archivePath: String, destinationPath: String, config: TunnelConfig) async throws {
-        let socketPath = CommandBuilder.sshControlPath(for: config)
-        var args = [
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=\(socketPath)",
-            "-o", "StrictHostKeyChecking=ask",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-        ]
-        
-        if let port = config.sshPort {
-            args += ["-p", String(port)]
-        }
-        if let identity = config.identityFile, !identity.isEmpty {
-            args += ["-i", identity]
-        }
-        if let jump = config.jumpHost, !jump.isEmpty {
-            args += ["-J", jump]
-        }
-        
+    public static func decompress(
+        archivePath: String, destinationPath: String,
+        overwrite: Bool = true, config: TunnelConfig
+    ) async throws {
         // Detect archive format by extension and build appropriate command
-        guard let command = extractCommand(for: archivePath, destinationPath: destinationPath) else {
+        guard let command = extractCommand(
+            for: archivePath, destinationPath: destinationPath, overwrite: overwrite
+        ) else {
             throw SFTPError.commandFailed("不支持的压缩格式: \(archivePath)")
         }
-        
-        args += ["--", config.destination, command]
+        let args = try sshCommand(for: config) + [command]
         
         let (output, status) = try await runSSHCommand(args: args, config: config)
         
