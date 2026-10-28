@@ -82,34 +82,18 @@ public enum SFTPError: LocalizedError, Equatable {
 /// an existing SSH control socket from a running tunnel.
 public enum SFTPClient {
     
-    /// Build SFTP connection arguments. When `useControlMaster` is true, multiplexes
-    /// over the tunnel's existing SSH connection for fast interactive operations.
-    /// When false, establishes an independent SSH connection for file transfers,
-    /// avoiding ControlMaster contention and enabling parallel transfers.
-    public static func sftpCommand(for config: TunnelConfig, useControlMaster: Bool = true) throws -> [String] {
-        var args: [String]
-        
-        if useControlMaster {
-            let socketPath = CommandBuilder.sshControlPath(for: config)
-            args = [
-                "-o", "ControlMaster=no",
-                "-o", "ControlPath=\(socketPath)",
-                "-o", "StrictHostKeyChecking=ask",
-                "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=3",
-            ]
-        } else {
-            // Independent connection for transfers: no ControlMaster, longer keepalive.
-            args = [
-                "-o", "StrictHostKeyChecking=ask",
-                "-o", "ServerAliveInterval=30",
-                "-o", "ServerAliveCountMax=6",
-                "-o", "ConnectTimeout=15",
-                "-o", "PreferredAuthentications=publickey,password",
-                "-o", "KbdInteractiveAuthentication=no",
-                "-o", "BatchMode=no",
-            ]
-        }
+    /// Build SFTP connection arguments, multiplexing over the tunnel's existing
+    /// SSH connection. The master has already authenticated, so no credentials
+    /// are needed here and none are passed to child processes.
+    public static func sftpCommand(for config: TunnelConfig) throws -> [String] {
+        let socketPath = CommandBuilder.sshControlPath(for: config)
+        var args = [
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=\(socketPath)",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+        ]
         
         if let port = config.sshPort {
             args += ["-P", String(port)]
@@ -125,14 +109,14 @@ public enum SFTPClient {
         return args
     }
     
-    /// Build SSH command arguments for running remote commands.
-    /// Always uses ControlMaster for fast execution of small operations.
+    /// Build SSH command arguments for running remote commands, multiplexing
+    /// over the tunnel's ControlMaster.
     private static func sshCommand(for config: TunnelConfig) throws -> [String] {
         let socketPath = CommandBuilder.sshControlPath(for: config)
         var args = [
             "-o", "ControlMaster=no",
             "-o", "ControlPath=\(socketPath)",
-            "-o", "StrictHostKeyChecking=ask",
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
         ]
@@ -182,11 +166,12 @@ public enum SFTPClient {
         return try parseStatOutput(output, path: remotePath)
     }
     
-    /// Download a file from remote to local using an independent SSH connection
-    /// to avoid ControlMaster contention and allow parallel transfers.
+    /// Download a file from remote to local, multiplexing over the tunnel's
+    /// ControlMaster: the master already authenticated, so no credentials are
+    /// needed here and none are passed to the child process.
     public static func download(remotePath: String, localPath: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws {
         try Task.checkCancellation()
-        let sftpArgs = try sftpCommand(for: config, useControlMaster: false)
+        let sftpArgs = try sftpCommand(for: config)
         let batchCommands = "get -r \(Self.escapeSFTPArg(remotePath)) \(Self.escapeSFTPArg(localPath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config, onProcessStart: onProcessStart)
@@ -196,11 +181,10 @@ public enum SFTPClient {
         }
     }
     
-    /// Upload a file from local to remote using an independent SSH connection
-    /// to avoid ControlMaster contention and allow parallel transfers.
+    /// Upload a file from local to remote, multiplexing over the tunnel's ControlMaster.
     public static func upload(localPath: String, remotePath: String, config: TunnelConfig, onProcessStart: ((Process) -> Void)? = nil) async throws {
         try Task.checkCancellation()
-        let sftpArgs = try sftpCommand(for: config, useControlMaster: false)
+        let sftpArgs = try sftpCommand(for: config)
         let batchCommands = "put -r \(Self.escapeSFTPArg(localPath)) \(Self.escapeSFTPArg(remotePath))\nbye\n"
         
         let (output, status) = try await runSFTPBatch(args: sftpArgs, batchCommands: batchCommands, config: config, onProcessStart: onProcessStart)
@@ -481,9 +465,8 @@ public enum SFTPClient {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: CommandBuilder.sshPath)
                 process.arguments = args
-                if let env = try? MTunlKeychain.askpassEnvironment(for: config) {
-                    process.environment = env
-                }
+                // No environment overrides: the ControlMaster already authenticated,
+                // and askpass secrets must not leak into child processes.
                 
                 let pipe = Pipe()
                 process.standardOutput = pipe
@@ -495,12 +478,10 @@ public enum SFTPClient {
                     // Read output asynchronously to avoid pipe buffer deadlock
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
-                    MTunlKeychain.cleanupAskpassScript()
                     
                     let output = String(data: data, encoding: .utf8) ?? ""
                     continuation.resume(returning: (output, process.terminationStatus))
                 } catch {
-                    MTunlKeychain.cleanupAskpassScript()
                     continuation.resume(throwing: SFTPError.commandFailed(error.localizedDescription))
                 }
             }
@@ -513,9 +494,8 @@ public enum SFTPClient {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/sftp")
                 process.arguments = ["-b", "-"] + args
-                if let env = try? MTunlKeychain.askpassEnvironment(for: config) {
-                    process.environment = env
-                }
+                // No environment overrides: the ControlMaster already authenticated,
+                // and askpass secrets must not leak into child processes.
                 
                 let inputPipe = Pipe()
                 let outputPipe = Pipe()
@@ -539,12 +519,10 @@ public enum SFTPClient {
                     // Read output asynchronously to avoid pipe buffer deadlock
                     let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
-                    MTunlKeychain.cleanupAskpassScript()
                     
                     let output = String(data: data, encoding: .utf8) ?? ""
                     continuation.resume(returning: (output, process.terminationStatus))
                 } catch {
-                    MTunlKeychain.cleanupAskpassScript()
                     continuation.resume(throwing: SFTPError.commandFailed(error.localizedDescription))
                 }
             }

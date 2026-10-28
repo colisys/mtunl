@@ -36,21 +36,16 @@ final class MTunlKeychainTests: XCTestCase {
         XCTAssertEqual(MTunlKeychain.account(for: noUser), "example.com")
     }
 
-    func testAskpassEnvironmentOnlyWhenPasswordStored() throws {
-        let config = makeConfig(host: "keychain-test2.invalid")
+    func testSFTPCommandsNeverReferenceAskpassOrPasswords() throws {
+        // SFTP multiplexes over the ControlMaster: its command lines must never
+        // set up credential plumbing (askpass, env secrets) of any kind.
+        let config = makeConfig(host: "sftp-auth-test.invalid")
+        XCTAssertTrue(MTunlKeychain.savePassword("pw", for: config))
         defer { MTunlKeychain.deletePassword(for: config) }
 
-        MTunlKeychain.deletePassword(for: config)
-        XCTAssertNil(try MTunlKeychain.askpassEnvironment(for: config))
-
-        XCTAssertTrue(MTunlKeychain.savePassword("pw", for: config))
-        let env = try MTunlKeychain.askpassEnvironment(for: config)
-        XCTAssertNotNil(env)
-        XCTAssertEqual(env?["SSH_ASKPASS_REQUIRE"], "force")
-        XCTAssertNotNil(env?["SSH_ASKPASS"])
-        // The askpass script itself must not contain the secret
-        let script = try String(contentsOfFile: env!["SSH_ASKPASS"]!, encoding: .utf8)
-        XCTAssertFalse(script.contains("pw"))
-        MTunlKeychain.cleanupAskpassScript()
+        let sftpArguments = try SFTPClient.sftpCommand(for: config).joined(separator: " ")
+        XCTAssertFalse(sftpArguments.lowercased().contains("askpass"))
+        XCTAssertFalse(sftpArguments.lowercased().contains("preferredauthentications"))
+        XCTAssertTrue(sftpArguments.contains("ControlPath=/tmp/mtunl-"))
     }
 }
