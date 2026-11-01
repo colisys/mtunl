@@ -42,6 +42,14 @@ final class TunnelModel: ObservableObject {
         return url
     }
 
+    /// Returns the path to the main executable inside MTunl.app for LaunchAgent.
+    private var appExecutableURL: URL? {
+        guard let executableURL = Bundle.main.executableURL,
+              let bundleURL = Bundle.main.bundleURL as URL?,
+              bundleURL.pathExtension == "app" else { return nil }
+        return executableURL
+    }
+
     private func loadConfigs() {
         do { configs = try store.load() } catch {
             errorMessage = "读取配置失败：\(error.localizedDescription)"
@@ -324,7 +332,7 @@ final class TunnelModel: ObservableObject {
     func setLoginStart(_ enabled: Bool) {
         do {
             if enabled {
-                guard let url = daemonURL else { throw TunnelValidationError("找不到应用内的 mtunlctl") }
+                guard let url = appExecutableURL else { throw TunnelValidationError("找不到应用本身的可执行文件") }
                 try LaunchAgent.install(executable: url.path)
             } else {
                 try LaunchAgent.uninstall()

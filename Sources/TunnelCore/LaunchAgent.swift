@@ -1,7 +1,8 @@
 import Foundation
 import Darwin
 
-/// Login-time autostart for the daemon through a per-user LaunchAgent.
+/// Login-time autostart for the app through a per-user LaunchAgent.
+/// Starts MTunl.app which will launch the daemon via ensureDaemon().
 public enum LaunchAgent {
     public static let label = "local.mtunl.daemon"
 
@@ -15,18 +16,18 @@ public enum LaunchAgent {
             .appendingPathComponent("Library/Logs/mtunl.log").path
     }
 
-    /// `SuccessfulExit=false` restarts the daemon after a crash but not after a
-    /// clean `mtunlctl quit`.
+    /// Launches MTunl.app at login. The app will start the daemon if needed.
+    /// `executable` is the path to MTunl.app/Contents/MacOS/MTunl.
     public static func plist(executable: String) throws -> Data {
+        guard let appPath = executable.components(separatedBy: "/Contents/MacOS/").first,
+              appPath.hasSuffix(".app") else {
+            throw TunnelValidationError("可执行文件路径必须在 .app bundle 中")
+        }
         let dictionary: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [executable, "serve"],
+            "ProgramArguments": ["/usr/bin/open", "-a", appPath],
             "RunAtLoad": true,
-            "KeepAlive": ["SuccessfulExit": false],
-            "ThrottleInterval": 10,
-            "ProcessType": "Background",
-            "StandardOutPath": logPath,
-            "StandardErrorPath": logPath,
+            "ProcessType": "Interactive",
         ]
         return try PropertyListSerialization.data(fromPropertyList: dictionary, format: .xml, options: 0)
     }
@@ -36,7 +37,7 @@ public enum LaunchAgent {
     }
 
     public static func install(executable: String) throws {
-        guard executable.hasPrefix("/") else { throw TunnelValidationError("守护进程路径必须是绝对路径") }
+        guard executable.hasPrefix("/") else { throw TunnelValidationError("可执行文件路径必须是绝对路径") }
         let directory = plistURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try plist(executable: executable).write(to: plistURL, options: .atomic)

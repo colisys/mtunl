@@ -136,7 +136,27 @@ case "command":
     } catch { fail("错误：\(error.localizedDescription)") }
 case "install-agent":
     do {
-        try LaunchAgent.install(executable: selfPath())
+        // Try to find MTunl.app by looking for it relative to mtunlctl
+        let mtunlctlPath = selfPath()
+        let possibleAppPath: String?
+        if mtunlctlPath.contains("/MTunl.app/Contents/MacOS/") {
+            // Running from inside the app bundle
+            possibleAppPath = mtunlctlPath.components(separatedBy: "/Contents/MacOS/").first
+        } else {
+            // Try common locations
+            let candidates = [
+                "/Applications/MTunl.app/Contents/MacOS/MTunl",
+                "~/Applications/MTunl.app/Contents/MacOS/MTunl",
+            ]
+            possibleAppPath = candidates.first { path in
+                let expanded = NSString(string: path).expandingTildeInPath
+                return FileManager.default.fileExists(atPath: expanded)
+            }.map { NSString(string: $0).expandingTildeInPath }
+        }
+        guard let appExecPath = possibleAppPath else {
+            fail("找不到 MTunl.app，请确保应用已安装到 /Applications 或 ~/Applications")
+        }
+        try LaunchAgent.install(executable: appExecPath)
         print("已安装登录自启：\(LaunchAgent.plistURL.path)")
     } catch { fail("错误：\(error.localizedDescription)") }
 case "uninstall-agent":
